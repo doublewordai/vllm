@@ -371,6 +371,35 @@ class PyNcclCommunicator:
     def group_end(self):
         self.nccl.ncclGroupEnd()
 
+    def suspend(self):
+        """Destroy NCCL communicator to release IPC handles before
+        cuda-checkpoint. Call resume() with a fresh unique_id to rebuild."""
+        if self.disabled or not self.available:
+            return
+        stream = current_stream()
+        stream.synchronize()
+        self.nccl.ncclCommDestroy(self.comm)
+        self.comm = None
+        self.disabled = True
+        logger.info("PyNcclCommunicator suspended (rank %d)", self.rank)
+
+    def resume(self, unique_id: ncclUniqueId):
+        """Rebuild NCCL communicator with a fresh unique_id after
+        cuda-checkpoint restore."""
+        if not self.available:
+            return
+        with torch.cuda.device(self.device):
+            self.comm = self.nccl.ncclCommInitRank(
+                self.world_size, unique_id, self.rank
+            )
+            self.disabled = False
+            # Warmup all_reduce
+            data = torch.zeros(1, device=self.device)
+            self.all_reduce(data)
+            current_stream().synchronize()
+            del data
+        logger.info("PyNcclCommunicator resumed (rank %d)", self.rank)
+
     def register_comm_window(self, tensor: torch.Tensor):
         return self.nccl.ncclCommWindowRegister(
             self.comm,
