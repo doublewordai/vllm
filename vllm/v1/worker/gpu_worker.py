@@ -168,6 +168,17 @@ class Worker(WorkerBase):
         else:
             return nullcontext()
 
+    def suspend_nccl(self) -> None:
+        """Tear down NCCL communicators before cuda-checkpoint."""
+        torch.cuda.synchronize()
+        from vllm.distributed.parallel_state import suspend_all_nccl
+        suspend_all_nccl()
+
+    def resume_nccl(self) -> None:
+        """Rebuild NCCL communicators after cuda-checkpoint restore."""
+        from vllm.distributed.parallel_state import resume_all_nccl
+        resume_all_nccl()
+
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks

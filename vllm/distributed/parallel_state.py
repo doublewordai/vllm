@@ -318,6 +318,9 @@ class GroupCoordinator:
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
 
+        self._group_ranks = group_ranks
+        self._torch_distributed_backend = torch_distributed_backend
+
         self_device_group = None
         self_cpu_group = None
 
@@ -996,6 +999,61 @@ class GroupCoordinator:
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
+    def suspend_nccl(self):
+        """Tear down NCCL resources (device_group + pynccl_comm) before
+        cuda-checkpoint.  Gloo cpu_group is kept alive for coordination."""
+        if self.world_size <= 1:
+            return
+        # Destroy the torch.distributed NCCL process group
+        if hasattr(self, "device_group"):
+            torch.distributed.destroy_process_group(self.device_group)
+            del self.device_group
+        # Destroy the pynccl communicator
+        if (self.device_communicator is not None
+                and self.device_communicator.pynccl_comm is not None):
+            self.device_communicator.pynccl_comm.suspend()
+
+    def resume_nccl(self):
+        """Rebuild NCCL resources after cuda-checkpoint restore.
+        Uses the surviving gloo cpu_group to distribute a fresh NCCL ID.
+
+        Replays the full group_ranks creation loop so that all ranks in
+        the world group call new_group in the same order as initialization."""
+        if self.world_size <= 1:
+            return
+        from vllm.distributed.device_communicators.pynccl_wrapper import (
+            ncclUniqueId,
+        )
+        # Recreate torch.distributed NCCL process group — must replay the
+        # full group_ranks loop so all world ranks participate in the same
+        # collective calls in the same order as __init__.
+        for ranks in self._group_ranks:
+            device_group = torch.distributed.new_group(
+                ranks, backend=self._torch_distributed_backend
+            )
+            if self.rank in ranks:
+                self.device_group = device_group
+        # Update the device_communicator's reference to the new device_group
+        if self.device_communicator is not None:
+            self.device_communicator.device_group = self.device_group
+        # Generate + broadcast fresh NCCL unique ID via gloo
+        if self.rank_in_group == 0:
+            pynccl_comm = self.device_communicator.pynccl_comm
+            unique_id = pynccl_comm.nccl.ncclGetUniqueId()
+        else:
+            unique_id = ncclUniqueId()
+        tensor = torch.ByteTensor(list(unique_id.internal))
+        torch.distributed.broadcast(
+            tensor, src=self.ranks[0], group=self.cpu_group
+        )
+        byte_list = tensor.tolist()
+        for i, byte in enumerate(byte_list):
+            unique_id.internal[i] = byte
+        # Resume pynccl communicator
+        if (self.device_communicator is not None
+                and self.device_communicator.pynccl_comm is not None):
+            self.device_communicator.pynccl_comm.resume(unique_id)
+
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
         if self.device_communicator is not None:
             self.device_communicator.prepare_communication_buffer_for_model(model)
@@ -1585,6 +1643,24 @@ def destroy_model_parallel():
     if _EP:
         _EP.destroy()
     _EP = None
+
+
+def suspend_all_nccl():
+    """Suspend NCCL communicators on all model-parallel groups.
+    Call before cuda-checkpoint."""
+    for group in [_TP, _DCP, _PCP, _PP, _DP, _EP]:
+        if group is not None:
+            group.suspend_nccl()
+    logger.info("All NCCL communicators suspended")
+
+
+def resume_all_nccl():
+    """Resume NCCL communicators on all model-parallel groups.
+    Call after cuda-checkpoint restore."""
+    for group in [_EP, _DP, _PP, _PCP, _DCP, _TP]:
+        if group is not None:
+            group.resume_nccl()
+    logger.info("All NCCL communicators resumed")
 
 
 def destroy_distributed_environment():
