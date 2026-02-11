@@ -61,10 +61,11 @@ def replace_parameter(layer: torch.nn.Module, param_name: str, new_data: torch.T
         new_data = new_data.data
     new_param = torch.nn.Parameter(new_data, requires_grad=False)
 
+    # Copy all custom attributes (weight_loader, quant_method, etc.)
+    # so that layerwise reload can re-use them when reloading weights.
     old_param: torch.nn.Parameter | None = getattr(layer, param_name, None)
-    if old_param is not None and hasattr(old_param, "weight_loader"):
-        weight_loader = old_param.weight_loader
-        set_weight_attrs(new_param, {"weight_loader": weight_loader})
+    if old_param is not None:
+        new_param.__dict__.update(old_param.__dict__)
 
     setattr(layer, param_name, new_param)
 
