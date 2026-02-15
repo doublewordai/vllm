@@ -1,10 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from http import HTTPStatus
+from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing_extensions import assert_never
+
+try:
+    import orjson
+
+    class _ORJSONResponse(JSONResponse):
+        """JSONResponse using orjson for ~5-10x faster float serialization."""
+        media_type = "application/json"
+
+        def render(self, content: Any) -> bytes:
+            return orjson.dumps(content)
+
+    _EmbeddingJSONResponse = _ORJSONResponse
+except ImportError:
+    _EmbeddingJSONResponse = JSONResponse
 
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.utils import validate_json_request
@@ -54,7 +69,7 @@ async def create_embedding(
             content=generator.model_dump(), status_code=generator.error.code
         )
     elif isinstance(generator, EmbeddingResponse):
-        return JSONResponse(content=generator.model_dump())
+        return _EmbeddingJSONResponse(content=generator.model_dump())
     elif isinstance(generator, EmbeddingBytesResponse):
         return StreamingResponse(
             content=generator.content,
