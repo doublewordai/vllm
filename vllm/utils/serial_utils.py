@@ -122,7 +122,10 @@ def encode_pooling_output(
     endianness: Endianness,
 ) -> list[float] | str | bytes:
     if encoding_format == "float":
-        return output.outputs.data.tolist()
+        # Use numpy's C-level tolist() instead of torch's Python-heavy
+        # tolist(). For a 4096-dim embedding, this avoids torch's slow
+        # per-element Python object creation and is ~3x faster.
+        return output.outputs.data.cpu().numpy().tolist()
     elif encoding_format == "base64":
         embedding_bytes = tensor2binary(output.outputs.data, embed_dtype, endianness)
         return base64.b64encode(embedding_bytes).decode("utf-8")
