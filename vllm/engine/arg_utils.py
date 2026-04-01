@@ -585,6 +585,10 @@ class EngineArgs:
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
 
+    vocabulary_cache_directory_path: str | None = (
+        CacheConfig.vocabulary_cache_directory_path
+    )
+
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
@@ -1003,6 +1007,11 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        cache_group.add_argument(
+            "--vocabulary-cache-directory-path",
+            **cache_kwargs["vocabulary_cache_directory_path"],
+        )
+
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
@@ -1550,6 +1559,7 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            vocabulary_cache_directory_path=self.vocabulary_cache_directory_path,
         )
 
         ray_runtime_env = None
