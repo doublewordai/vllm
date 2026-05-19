@@ -5099,6 +5099,42 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+
+        # Doubleword fork: optionally compress transformer-layer weights in
+        # VRAM, releasing the freed memory for KV cache. Runs before the KV
+        # cache budget is computed so the savings are passed through. See
+        # vllm/compressed_weights.py.
+        if envs.VLLM_COMPRESS_WEIGHTS and not load_dummy_weights:
+            # Refuse to install alongside CUDA graph capture. nvcomp's
+            # deflate HW decode kernel is not cuda-graph-capture-safe in
+            # nvcomp 5.2 (capture aborts with cudaErrorStreamCaptureInvalidated
+            # when the decode op runs inside a capture). Eager mode works.
+            # Remove this guard once nvcomp gains capture safety or we
+            # implement a compile-aware decompression path.
+            if not self.vllm_config.model_config.enforce_eager:
+                raise RuntimeError(
+                    "VLLM_COMPRESS_WEIGHTS=1 requires --enforce-eager in "
+                    "this version. nvcomp deflate HW decode invalidates "
+                    "CUDA graph capture; work is ongoing to resolve this."
+                )
+
+            from vllm.compressed_weights import install_compressed_weights
+
+            self._compressed_weights = install_compressed_weights(self.model)
+            if self._compressed_weights is not None:
+                # vLLM's KV cache budget subtracts model_memory_usage (measured
+                # during load above) from the requested budget. Update it to
+                # the post-compression torch allocation so the savings are
+                # granted to KV cache.
+                old = self.model_memory_usage
+                self.model_memory_usage = torch.cuda.memory_allocated()
+                logger.info(
+                    "Compressed weights: model_memory_usage %.2f GiB "
+                    "\u2192 %.2f GiB (freed %.2f GiB for KV cache)",
+                    old / 1024**3,
+                    self.model_memory_usage / 1024**3,
+                    (old - self.model_memory_usage) / 1024**3,
+                )
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())

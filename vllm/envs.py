@@ -128,6 +128,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
+    # Doubleword fork: enable in-VRAM compressed-weight storage (nvcomp
+    # deflate HW). Frees memory for KV cache; see vllm/compressed_weights.py.
+    VLLM_COMPRESS_WEIGHTS: bool = False
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -1131,6 +1134,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))
     ),
+    # Doubleword fork: if set, compress transformer-layer weights in VRAM after
+    # model load and decompress on-demand via forward pre-hooks. Reclaimed
+    # memory is made visible to vLLM's KV cache budget. Requires nvcomp
+    # (already part of the Blackwell-capable CUDA image); best with a GPU
+    # that has the hardware deflate decompression engine.
+    "VLLM_COMPRESS_WEIGHTS": lambda: bool(
+        int(os.getenv("VLLM_COMPRESS_WEIGHTS", "0"))
+    ),
     "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
     ),
@@ -1954,6 +1965,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ASSETS_CACHE_MODEL_CLEAN",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
+        "VLLM_COMPRESS_WEIGHTS",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
