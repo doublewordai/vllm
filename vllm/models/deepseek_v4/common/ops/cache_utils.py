@@ -16,6 +16,7 @@ preparation.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
@@ -39,6 +40,7 @@ def quantize_and_insert_k_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+    is_fnuz: tl.constexpr,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -113,7 +115,10 @@ def quantize_and_insert_k_kernel(
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
             # Convert to fp8, then bitcast to uint8 for storage
-            x_fp8 = x_clamped.to(tl.float8e4nv)
+            if is_fnuz:
+                x_fp8 = x_clamped.to(tl.float8e4b8)
+            else:
+                x_fp8 = x_clamped.to(tl.float8e4nv)
             x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
@@ -171,7 +176,7 @@ def quantize_and_insert_k_cache(
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
-    FP8_MAX = 448.0
+    FP8_MAX = torch.finfo(current_platform.fp8_dtype()).max
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     grid = (num_tokens,)
@@ -191,6 +196,161 @@ def quantize_and_insert_k_cache(
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
+        is_fnuz=current_platform.is_fp8_fnuz(),
+    )
+
+
+@triton.jit
+def fused_qnorm_rope_quant_insert_k_kernel(
+    q_ptr,  # [num_tokens, num_heads, 512] bf16, in-place output
+    kv_ptr,  # [num_tokens, 512] bf16
+    slot_mapping_ptr,  # [kv_num_tokens] int64
+    positions_ptr,  # [num_tokens] int64
+    cos_sin_cache_ptr,  # [max_pos, 64] fp32/fp16/bf16
+    k_cache_ptr,  # [num_blocks, block_bytes] uint8
+    q_num_tokens,
+    kv_num_tokens,
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    kv_stride_t: tl.constexpr,
+    kv_stride_d: tl.constexpr,
+    cos_sin_stride: tl.constexpr,
+    eps: tl.constexpr,
+    fp8_max: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    block_stride: tl.constexpr,
+    is_fnuz: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    offsets = tl.arange(0, 512)
+    q_row = q_ptr + token_idx * q_stride_t + head_idx * q_stride_h
+    q_vals = tl.load(q_row + offsets * q_stride_d).to(tl.float32)
+    variance = tl.sum(q_vals * q_vals, axis=0) / 512.0
+    q_norm = q_vals * tl.rsqrt(variance + eps)
+
+    pos = tl.load(positions_ptr + token_idx)
+    q_out = q_norm
+    rel = offsets - 448
+    pair = rel // 2
+    is_rope = offsets >= 448
+    is_odd = (rel % 2) == 1
+    pair_base = 448 + pair * 2
+    q_even = tl.load(q_row + pair_base * q_stride_d, mask=is_rope, other=0.0).to(
+        tl.float32
+    )
+    q_odd = tl.load(q_row + (pair_base + 1) * q_stride_d, mask=is_rope, other=0.0).to(
+        tl.float32
+    )
+    q_even = q_even * tl.rsqrt(variance + eps)
+    q_odd = q_odd * tl.rsqrt(variance + eps)
+    q_cos = tl.load(
+        cos_sin_cache_ptr + pos * cos_sin_stride + pair, mask=is_rope, other=1.0
+    ).to(tl.float32)
+    q_sin = tl.load(
+        cos_sin_cache_ptr + pos * cos_sin_stride + 32 + pair,
+        mask=is_rope,
+        other=0.0,
+    ).to(tl.float32)
+    q_rot_even = q_even * q_cos - q_odd * q_sin
+    q_rot_odd = q_even * q_sin + q_odd * q_cos
+    q_out = tl.where(is_rope, tl.where(is_odd, q_rot_odd, q_rot_even), q_out)
+    tl.store(q_row + offsets * q_stride_d, q_out.to(tl.bfloat16))
+
+    if head_idx != 0 or token_idx >= kv_num_tokens:
+        return
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx == -1:
+        return
+
+    block_idx = slot_idx // cache_block_size
+    pos_in_block = slot_idx % cache_block_size
+    cache_block_ptr = k_cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data_ptr = cache_block_ptr + pos_in_block * 576
+    token_scale_ptr = cache_block_ptr + cache_block_size * 576 + pos_in_block * 8
+    token_fp8_ptr = token_data_ptr
+    token_bf16_ptr = (token_data_ptr + 448).to(tl.pointer_type(tl.bfloat16))
+    kv_row = kv_ptr + token_idx * kv_stride_t
+
+    for qblock_idx in tl.static_range(7):
+        qblock_offsets = qblock_idx * 64 + tl.arange(0, 64)
+        x = tl.load(kv_row + qblock_offsets * kv_stride_d).to(tl.float32)
+        abs_x = tl.abs(x)
+        block_max = tl.max(abs_x, axis=0)
+        block_max = tl.maximum(block_max, 1e-4)
+        raw_scale = block_max / fp8_max
+        exponent = tl.ceil(tl.log2(raw_scale))
+        scale = tl.exp2(exponent)
+        x_clamped = tl.clamp(x / scale, -fp8_max, fp8_max)
+        if is_fnuz:
+            x_fp8 = x_clamped.to(tl.float8e4b8)
+        else:
+            x_fp8 = x_clamped.to(tl.float8e4nv)
+        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+        tl.store(token_fp8_ptr + qblock_offsets, x_uint8)
+        encoded_scale = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0)
+        tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
+
+    tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
+
+    kv_rope_offsets = tl.arange(0, 64)
+    kv_rel_pair = kv_rope_offsets // 2
+    kv_is_odd = (kv_rope_offsets % 2) == 1
+    kv_even = tl.load(kv_row + (448 + kv_rel_pair * 2) * kv_stride_d).to(tl.float32)
+    kv_odd = tl.load(kv_row + (448 + kv_rel_pair * 2 + 1) * kv_stride_d).to(
+        tl.float32
+    )
+    kv_cos = tl.load(cos_sin_cache_ptr + pos * cos_sin_stride + kv_rel_pair).to(
+        tl.float32
+    )
+    kv_sin = tl.load(cos_sin_cache_ptr + pos * cos_sin_stride + 32 + kv_rel_pair).to(
+        tl.float32
+    )
+    kv_rot_even = kv_even * kv_cos - kv_odd * kv_sin
+    kv_rot_odd = kv_even * kv_sin + kv_odd * kv_cos
+    kv_rope = tl.where(kv_is_odd, kv_rot_odd, kv_rot_even)
+    tl.store(token_bf16_ptr + kv_rope_offsets, kv_rope.to(tl.bfloat16))
+
+
+def fused_qnorm_rope_quant_insert_k_cache(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    block_size: int,
+) -> None:
+    assert q.dim() == 3 and q.shape[-1] == 512
+    assert kv.dim() == 2 and kv.shape[-1] == 512
+    assert q.dtype == torch.bfloat16
+    assert kv.dtype == torch.bfloat16
+    assert k_cache.dtype == torch.uint8
+
+    fused_qnorm_rope_quant_insert_k_kernel[(q.shape[0], q.shape[1])](
+        q,
+        kv,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        k_cache,
+        q.shape[0],
+        slot_mapping.shape[0],
+        q_stride_t=q.stride(0),
+        q_stride_h=q.stride(1),
+        q_stride_d=q.stride(2),
+        kv_stride_t=kv.stride(0),
+        kv_stride_d=kv.stride(1),
+        cos_sin_stride=cos_sin_cache.stride(0),
+        eps=eps,
+        fp8_max=torch.finfo(current_platform.fp8_dtype()).max,
+        cache_block_size=block_size,
+        block_stride=k_cache.stride(0),
+        is_fnuz=current_platform.is_fp8_fnuz(),
     )
 
 
@@ -216,6 +376,7 @@ def _dequantize_and_gather_k_kernel(
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
+    is_fnuz: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -274,7 +435,10 @@ def _dequantize_and_gather_k_kernel(
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
                 # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                if is_fnuz:
+                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                else:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
 
                 # Convert fp8 to float32 for computation
                 x_float = x_fp8.to(tl.float32)
@@ -322,7 +486,7 @@ def dequantize_and_gather_k_cache_triton(
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
-    FP8_MAX = 448.0
+    FP8_MAX = torch.finfo(current_platform.fp8_dtype()).max
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     num_reqs = seq_lens.shape[0]
@@ -347,6 +511,7 @@ def dequantize_and_gather_k_cache_triton(
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
+        is_fnuz=current_platform.is_fp8_fnuz(),
     )
 
 
