@@ -26,6 +26,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 )
 from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_and_gather_k_cache
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    build_ragged_indices_from_dense_out,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
 )
@@ -358,6 +359,7 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
                 dtype=torch.int32,
                 device=self.device,
             )
+            self.c128a_decode_topk_ragged_indptr_buffer = torch.zeros(
                 max_tokens + 1,
                 dtype=torch.int32,
                 device=self.device,
@@ -382,8 +384,12 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
         if dense_decode is not None and decode_lens is not None:
             assert self.c128a_decode_topk_ragged_indices_buffer is not None
             assert self.c128a_decode_topk_ragged_indptr_buffer is not None
+            ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
+                dense_decode.reshape(dense_decode.shape[0], -1),
+                decode_lens,
                 self.c128a_decode_topk_ragged_indices_buffer,
                 self.c128a_decode_topk_ragged_indptr_buffer,
+                max_entries_per_row=self.c128a_max_compressed,
             )
 
         return DeepseekV4ROCMAiterMLASparseMetadata(
@@ -402,6 +408,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
+        self.decode_swa_ragged_indptr_buffer = torch.zeros(
             max_tokens + 1,
             dtype=torch.int32,
             device=self.device,
@@ -426,10 +433,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
+            ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
                 base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
                 base.decode_swa_lens,
                 self.decode_swa_ragged_indices_buffer,
                 self.decode_swa_ragged_indptr_buffer,
+                max_entries_per_row=self.window_size,
             )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(

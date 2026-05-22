@@ -1276,6 +1276,59 @@ def build_ragged_indices_from_dense(
     return flat, indptr
 
 
+def build_ragged_indices_from_dense_out(
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    indices_out: torch.Tensor,
+    indptr_out: torch.Tensor,
+    num_rows_limit: int = -1,
+    max_entries_per_row: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack dense prefix rows directly into persistent ragged buffers.
+
+    This is the CUDA-graph-friendly decode variant of
+    build_ragged_indices_from_dense. It avoids allocating a dynamically sized
+    flat tensor and, more importantly, avoids the host sync from
+    ``int(indptr[-1].item())`` before copying into graph-stable buffers.
+
+    ``indptr_out[0]`` must already be initialized to zero. Keeping that value
+    persistent avoids a per-step host-to-device scalar copy in decode.
+    """
+    indices = indices.reshape(indices.shape[0], -1)
+    lengths = lengths.to(device=indices.device, dtype=torch.int32).reshape(-1)
+    assert lengths.numel() == indices.shape[0], (
+        f"Expected one length per row, got {lengths.shape} for indices {indices.shape}"
+    )
+
+    num_rows = indices.shape[0]
+    max_width = indices.shape[1] if indices.ndim == 2 else 0
+    max_entries = max(num_rows * (max_entries_per_row or max_width), 1)
+    assert indptr_out.numel() >= num_rows + 1
+    assert indices_out.numel() >= max_entries
+
+    lengths = lengths.clamp(min=0, max=max_width).contiguous()
+    indptr = indptr_out[: num_rows + 1]
+    torch.cumsum(lengths, dim=0, out=indptr[1:])
+
+    flat = indices_out[:max_entries]
+    if indices.numel() > 0 and max_width > 0:
+        block_size = 128
+        _pack_dense_prefix_to_ragged_kernel[
+            (num_rows, triton.cdiv(max_width, block_size))
+        ](
+            indices,
+            lengths,
+            indptr,
+            flat,
+            indices.stride(0),
+            int(num_rows_limit),
+            max_width,
+            BLOCK_SIZE=block_size,
+        )
+
+    return flat, indptr
+
+
 def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     if x.dtype == torch.int32 and x.ndim == 1 and x.is_contiguous():
         return x
