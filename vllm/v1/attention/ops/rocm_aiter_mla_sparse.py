@@ -1200,10 +1200,41 @@ def rocm_inv_rope_einsum(
 
     hidden_dim = o_ref.shape[-1]
     if hasattr(wo_a, "weight_scale_inv"):
+        cache_key = (
+            n_local_groups,
             o_lora_rank,
             hidden_dim,
+            wo_a.weight.data_ptr(),
+            wo_a.weight_scale_inv.data_ptr(),
         )
+        cached_key = getattr(wo_a, "_vllm_rocm_bf16_weight_key", None)
+        wo_a_weight = getattr(wo_a, "_vllm_rocm_bf16_weight_cache", None)
+        if cached_key != cache_key or wo_a_weight is None:
+            weight_fp32 = wo_a.weight.view(
+                n_local_groups, o_lora_rank, hidden_dim
+            ).to(torch.float32)
+            wo_a_scale = _expand_2d_block_scales(
+                wo_a.weight_scale_inv.view(
+                    n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
+                ),
+                o_lora_rank,
+                hidden_dim,
+            )
+            wo_a_weight = (weight_fp32 * wo_a_scale).to(torch.bfloat16)
+            wo_a._vllm_rocm_bf16_weight_cache = wo_a_weight
+            wo_a._vllm_rocm_bf16_weight_key = cache_key
     else:
+        cache_key = (n_local_groups, o_lora_rank, hidden_dim, wo_a.weight.data_ptr())
+        cached_key = getattr(wo_a, "_vllm_rocm_bf16_weight_key", None)
+        wo_a_weight = getattr(wo_a, "_vllm_rocm_bf16_weight_cache", None)
+        if cached_key != cache_key or wo_a_weight is None:
+            wo_a_weight = wo_a.weight.view(
+                n_local_groups, o_lora_rank, hidden_dim
+            ).to(torch.bfloat16)
+            wo_a._vllm_rocm_bf16_weight_cache = wo_a_weight
+            wo_a._vllm_rocm_bf16_weight_key = cache_key
+
+    assert wo_a_weight is not None
     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
 
 
