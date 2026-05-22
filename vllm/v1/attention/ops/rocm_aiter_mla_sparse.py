@@ -1714,6 +1714,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     attn_sink: torch.Tensor | None,
     nope_head_dim: int,
     rope_head_dim: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
@@ -1743,6 +1744,11 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
     block_k = 16 if head_dim >= 256 else 32
+    if out is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    else:
+        assert out.shape == q.shape, f"expected out shape {q.shape}, got {out.shape}"
+        assert out.dtype == torch.bfloat16, f"expected bf16 out, got {out.dtype}"
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
@@ -1812,6 +1818,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -1872,6 +1879,11 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
+    if out is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    else:
+        assert out.shape == q.shape, f"expected out shape {q.shape}, got {out.shape}"
+        assert out.dtype == torch.bfloat16, f"expected bf16 out, got {out.dtype}"
     _sparse_attn_decode_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         main_cache,
@@ -1922,6 +1934,7 @@ def _rocm_sparse_attn_decode_triton(
     main_ragged_indptr: torch.Tensor | None = None,
     extra_ragged_indices: torch.Tensor | None = None,
     extra_ragged_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -1957,6 +1970,7 @@ def _rocm_sparse_attn_decode_triton(
         extra_cache=extra_cache,
         extra_indices=extra_ragged_indices,
         extra_indptr=extra_ragged_indptr,
+        out=out,
     )
 
 
@@ -1985,6 +1999,7 @@ def rocm_sparse_attn_prefill(
     )
 
     if ragged_indices is not None and ragged_indptr is not None:
+        direct_out = output if output.dtype == torch.bfloat16 else None
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
             kv=kv.squeeze(1),
@@ -1994,6 +2009,7 @@ def rocm_sparse_attn_prefill(
             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
+            out=direct_out,
         )
     else:
         indices_2d = indices.reshape(indices.shape[0], -1)
@@ -2007,6 +2023,8 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
             topk_length=topk_length,
         )
+    if output_chunk is not output:
+        output.copy_(output_chunk.to(output.dtype))
 
 
 def rocm_sparse_attn_decode(
@@ -2073,4 +2091,7 @@ def rocm_sparse_attn_decode(
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
         extra_ragged_indptr=topk_ragged_indptr,
+        out=output if output.dtype == torch.bfloat16 else None,
     )
+    if attn_out is not output:
+        output.copy_(attn_out.to(output.dtype))
