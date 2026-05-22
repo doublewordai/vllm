@@ -1316,9 +1316,13 @@ class FusedMoE(PluggableLayer):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
-        return (
-            self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
-        )
+        mxfp4_backend = getattr(self.quant_method, "mxfp4_backend", None)
+        if (
+            mxfp4_backend is not None
+            and getattr(mxfp4_backend, "name", "") != "AITER_MXFP4_BF16"
+        ):
+            return self._expert_map
+        return self.expert_mask if self.rocm_aiter_fmoe_enabled else self._expert_map
 
     @classmethod
     def make_expert_params_mapping(
