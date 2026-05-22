@@ -1277,8 +1277,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
-        # ffn_norm is now folded into self.ffn.norm_gate; ffn() takes
-        # the pre-norm activation directly.
+        # ffn_norm is folded into self.ffn.norm_gate on the ROCm path.
         x = self.ffn(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
         return x, None, None, None

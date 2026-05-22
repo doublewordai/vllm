@@ -307,8 +307,9 @@ def _fused_inv_rope_fp8_quant_kernel_fake(
     return fp8_buf, scale_buf
 
 
-direct_register_custom_op(
-    op_name="fused_inv_rope_fp8_quant_kernel",
-    op_func=_fused_inv_rope_fp8_quant_kernel_impl,
-    fake_impl=_fused_inv_rope_fp8_quant_kernel_fake,
-)
+if not hasattr(torch.ops.vllm, "fused_inv_rope_fp8_quant_kernel"):
+    direct_register_custom_op(
+        op_name="fused_inv_rope_fp8_quant_kernel",
+        op_func=_fused_inv_rope_fp8_quant_kernel_impl,
+        fake_impl=_fused_inv_rope_fp8_quant_kernel_fake,
+    )

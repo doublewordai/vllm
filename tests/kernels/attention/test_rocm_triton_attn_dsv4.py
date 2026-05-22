@@ -71,6 +71,18 @@ def _ref_sparse_prefill_ragged(
     return out.to(torch.bfloat16)
 
 
+def _make_ragged(
+    rows: list[list[int]], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    indices = torch.tensor(
+        [idx for row in rows for idx in row], dtype=torch.int32, device=device
+    )
+    lens = torch.tensor([len(row) for row in rows], dtype=torch.int32, device=device)
+    indptr = torch.zeros(len(rows) + 1, dtype=torch.int32, device=device)
+    torch.cumsum(lens, dim=0, out=indptr[1:])
+    return indices, indptr
+
+
 def _pack_fp8_ds_mla_cache(kv: torch.Tensor, block_size: int) -> torch.Tensor:
     assert kv.shape[-1] == HEAD_DIM
     num_tokens = kv.shape[0]
@@ -116,6 +128,42 @@ def _read_fp8_ds_mla_cache(
     ]
     rope = rope_u8.view(torch.bfloat16).to(torch.float32)
     return torch.cat([nope, rope])
+
+
+def _ref_fp8_paged_mqa_logits_next1(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    batch_size, _, _, dim = q.shape
+    block_size = kv_cache.shape[1]
+    kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
+    logits = torch.full(
+        (batch_size, max_model_len),
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+
+    for batch_idx in range(batch_size):
+        seq_len = int(context_lens[batch_idx].item())
+        num_pages = (seq_len + block_size - 1) // block_size
+        pages = block_tables[batch_idx, :num_pages]
+        cache = kv_cache_flat[pages]
+        scale_offset = block_size * dim
+        cache_value = cache[..., :scale_offset].view(current_platform.fp8_dtype())
+        cache_value = cache_value.float().view(-1, dim)
+        cache_scale = cache[..., scale_offset:].view(torch.float32).contiguous()
+        cache_scale = cache_scale.view(-1)
+        score = torch.nn.functional.linear(cache_value, q[batch_idx, 0].float())
+        score = score.relu()
+        score = (score * weights[batch_idx][None, :]).sum(dim=1) * cache_scale
+        logits[batch_idx, :seq_len] = score[:seq_len]
+
+    return logits
 
 
 def _ref_sparse_decode_ragged(
@@ -249,18 +297,33 @@ def test_compute_global_topk_ragged_indices_and_indptr() -> None:
 
 
 @torch.inference_mode()
-def test_sparse_attn_prefill_ragged_kernel() -> None:
+@pytest.mark.parametrize("has_attn_sink", [False, True])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [[0, 2], [1, 3, 4], []],
+        [[4], [0, 1, 2, 3, 4], [2, 2, 0]],
+    ],
+)
+def test_sparse_attn_prefill_ragged_kernel(
+    rows: list[list[int]], has_attn_sink: bool
+) -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_prefill_ragged_triton,
     )
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    q = torch.randn(3, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    q = torch.randn(
+        len(rows), 17, HEAD_DIM, dtype=torch.bfloat16, device=device
+    ) * 0.125
     kv = torch.randn(5, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
-    indices = torch.tensor([0, 2, 1, 3, 4], dtype=torch.int32, device=device)
-    indptr = torch.tensor([0, 2, 5, 5], dtype=torch.int32, device=device)
-    attn_sink = torch.tensor([-0.25, 0.0, 0.25], dtype=torch.float32, device=device)
+    indices, indptr = _make_ragged(rows, device)
+    attn_sink = (
+        torch.linspace(-0.25, 0.25, q.shape[1], dtype=torch.float32, device=device)
+        if has_attn_sink
+        else None
+    )
     scale = HEAD_DIM**-0.5
 
     actual = _rocm_sparse_attn_prefill_ragged_triton(
@@ -273,15 +336,26 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
         nope_head_dim=NOPE_HEAD_DIM,
         rope_head_dim=ROPE_HEAD_DIM,
     )
-    expected = _ref_sparse_prefill_ragged(
-        q, kv, [[0, 2], [1, 3, 4], []], scale, attn_sink
-    )
+    expected = _ref_sparse_prefill_ragged(q, kv, rows, scale, attn_sink)
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 @torch.inference_mode()
-def test_sparse_attn_decode_ragged_kernel() -> None:
+@pytest.mark.parametrize("has_attn_sink", [False, True])
+@pytest.mark.parametrize(
+    ("main_rows", "extra_rows"),
+    [
+        ([[0, 2], [4, 1]], [[1], [3, 0]]),
+        ([[5], [0, 3, 3]], None),
+        ([[2], [1]], [[], [4, 2, 0]]),
+    ],
+)
+def test_sparse_attn_decode_ragged_kernel(
+    main_rows: list[list[int]],
+    extra_rows: list[list[int]] | None,
+    has_attn_sink: bool,
+) -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_decode_ragged_triton,
     )
@@ -289,16 +363,26 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
     device = torch.device("cuda")
     torch.manual_seed(1)
     block_size = 4
-    q = torch.randn(2, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    q = torch.randn(
+        len(main_rows), 17, HEAD_DIM, dtype=torch.bfloat16, device=device
+    ) * 0.125
     main_kv = torch.randn(6, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
     extra_kv = torch.randn(5, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
     main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size)
     extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size)
-    main_indices = torch.tensor([0, 2, 4, 1], dtype=torch.int32, device=device)
-    main_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
-    extra_indices = torch.tensor([1, 3, 0], dtype=torch.int32, device=device)
-    extra_indptr = torch.tensor([0, 1, 3], dtype=torch.int32, device=device)
-    attn_sink = torch.tensor([-0.1, 0.0, 0.1], dtype=torch.float32, device=device)
+    main_indices, main_indptr = _make_ragged(main_rows, device)
+    if extra_rows is None:
+        extra_indices = None
+        extra_indptr = None
+        extra_cache_arg = None
+    else:
+        extra_indices, extra_indptr = _make_ragged(extra_rows, device)
+        extra_cache_arg = extra_cache
+    attn_sink = (
+        torch.linspace(-0.1, 0.1, q.shape[1], dtype=torch.float32, device=device)
+        if has_attn_sink
+        else None
+    )
     scale = HEAD_DIM**-0.5
 
     actual = _rocm_sparse_attn_decode_ragged_triton(
@@ -310,22 +394,85 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
         attn_sink=attn_sink,
         nope_head_dim=NOPE_HEAD_DIM,
         rope_head_dim=ROPE_HEAD_DIM,
-        extra_cache=extra_cache,
+        extra_cache=extra_cache_arg,
         extra_indices=extra_indices,
         extra_indptr=extra_indptr,
     )
     expected = _ref_sparse_decode_ragged(
         q=q,
         main_cache=main_cache,
-        main_rows=[[0, 2], [4, 1]],
+        main_rows=main_rows,
         scale=scale,
         attn_sink=attn_sink,
         block_size=block_size,
-        extra_cache=extra_cache,
-        extra_rows=[[1], [3, 0]],
+        extra_cache=extra_cache_arg,
+        extra_rows=extra_rows,
     )
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_fp8_paged_mqa_logits_next1_tensorized_fallback() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    batch_size = 3
+    num_heads = 5
+    head_dim = 16
+    block_size = 8
+    max_model_len = 32
+    num_blocks = 12
+    fp8_dtype = current_platform.fp8_dtype()
+
+    q = (torch.randn(batch_size, 1, num_heads, head_dim, device=device) * 0.1).to(
+        fp8_dtype
+    )
+    weights = torch.rand(batch_size, num_heads, device=device)
+    context_lens = torch.tensor([5, 17, 31], dtype=torch.int32, device=device)
+    block_tables = torch.tensor(
+        [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]],
+        dtype=torch.int32,
+        device=device,
+    )
+    values = (torch.randn(num_blocks, block_size, 1, head_dim, device=device) * 0.1).to(
+        fp8_dtype
+    )
+    scales = torch.rand(
+        num_blocks, block_size, 1, 1, dtype=torch.float32, device=device
+    )
+    kv_cache = torch.empty(
+        num_blocks,
+        block_size,
+        1,
+        head_dim + 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    kv_cache[..., :head_dim] = values.view(torch.uint8)
+    kv_cache[..., head_dim:] = scales.view(torch.uint8)
+
+    actual = fp8_paged_mqa_logits_torch(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    )
+    expected = _ref_fp8_paged_mqa_logits_next1(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @torch.inference_mode()
