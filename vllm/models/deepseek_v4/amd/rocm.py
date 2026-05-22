@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -25,7 +27,6 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-    build_ragged_indices_from_dense,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
 )
@@ -35,6 +36,35 @@ if TYPE_CHECKING:
     from vllm.models.deepseek_v4.nvidia.ops.attention import (
         DeepseekV4MLAAttention,
     )
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0") == "1"
+
+
+def _log_sparse_prefill_mem_metrics(
+    event: str,
+    device: torch.device,
+    **fields: int | float | str | bool,
+) -> None:
+    if not _env_flag("DSV4_SPARSE_PREFILL_MEM_METRICS"):
+        return
+    free = total = allocated = reserved = 0
+    try:
+        free, total = torch.cuda.mem_get_info(device)
+        allocated = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+    except Exception:
+        pass
+    record = {
+        "event": event,
+        "free": int(free),
+        "total": int(total),
+        "allocated": int(allocated),
+        "reserved": int(reserved),
+        **fields,
+    }
+    print("DSV4_SPARSE_PREFILL_MEM " + json.dumps(record, sort_keys=True), flush=True)
 
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
@@ -424,30 +454,6 @@ def combine_topk_swa_indices_ragged(
     return combined_ragged, combined_indptr, combined_lens
 
 
-def _copy_ragged_to_graph_buffers(
-    ragged_indices: torch.Tensor,
-    ragged_indptr: torch.Tensor,
-    ragged_indices_buffer: torch.Tensor,
-    ragged_indptr_buffer: torch.Tensor,
-    num_rows: int,
-    max_entries_per_row: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Copy dynamic ragged metadata into persistent CUDA graph buffers.
-
-    FULL decode graphs capture kernel argument addresses. Keep the returned
-    tensors backed by stable storage, while indptr continues to bound reads.
-    """
-    indptr_out = ragged_indptr_buffer[: num_rows + 1]
-    indptr_out.copy_(ragged_indptr, non_blocking=True)
-
-    max_entries = max(num_rows * max_entries_per_row, 1)
-    ragged_out = ragged_indices_buffer[:max_entries]
-    nnz = ragged_indices.numel()
-    if nnz > 0:
-        ragged_out[:nnz].copy_(ragged_indices, non_blocking=True)
-    return ragged_out, indptr_out
-
-
 @dataclass
 class DeepseekV4ROCMAiterMLASparseMetadata(FlashMLASparseMetadata):
     """ROCm-specific DeepSeek V4 metadata carrying ragged decode topk."""
@@ -474,7 +480,6 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.c128a_decode_topk_ragged_indptr_buffer = torch.empty(
                 max_tokens + 1,
                 dtype=torch.int32,
                 device=self.device,
@@ -497,19 +502,10 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
         dense_decode = base.c128a_global_decode_topk_indices
         decode_lens = base.c128a_decode_topk_lens
         if dense_decode is not None and decode_lens is not None:
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                dense_decode.reshape(dense_decode.shape[0], -1),
-                decode_lens,
-            )
             assert self.c128a_decode_topk_ragged_indices_buffer is not None
             assert self.c128a_decode_topk_ragged_indptr_buffer is not None
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
                 self.c128a_decode_topk_ragged_indices_buffer,
                 self.c128a_decode_topk_ragged_indptr_buffer,
-                dense_decode.shape[0],
-                self.c128a_max_compressed,
             )
 
         return DeepseekV4ROCMAiterMLASparseMetadata(
@@ -528,7 +524,6 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
-        self.decode_swa_ragged_indptr_buffer = torch.empty(
             max_tokens + 1,
             dtype=torch.int32,
             device=self.device,
@@ -553,17 +548,10 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
                 base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
                 base.decode_swa_lens,
-            )
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
                 self.decode_swa_ragged_indices_buffer,
                 self.decode_swa_ragged_indptr_buffer,
-                base.num_decode_tokens,
-                self.window_size,
             )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(
@@ -773,26 +761,98 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
             assert topk_indices is not None
             top_k = topk_indices.shape[-1]
-            N = (layer.max_model_len + layer.compress_ratio - 1) // layer.compress_ratio
         else:
             assert layer.topk_indices_buffer is not None
             topk_indices = layer.topk_indices_buffer[num_decode_tokens:]
             top_k = 0
-            N = 0
 
-        M = N + layer.window_size + layer.max_num_batched_tokens
         num_chunks = (num_prefills + cls.PREFILL_CHUNK_SIZE - 1) // (
             cls.PREFILL_CHUNK_SIZE
         )
 
+        dynamic_workspace = _env_flag("DSV4_DYNAMIC_PREFILL_KV_WORKSPACE")
+        default_N = (
+            0
+            if swa_only
+            else (layer.max_model_len + layer.compress_ratio - 1)
+            // layer.compress_ratio
+        )
+        default_M = default_N + layer.window_size + layer.max_num_batched_tokens
+        seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+        gather_lens_cpu = swa_metadata.prefill_gather_lens_cpu
+        if dynamic_workspace:
+            assert seq_lens_cpu is not None
+            assert gather_lens_cpu is not None
+            max_N = 0
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * cls.PREFILL_CHUNK_SIZE
+                chunk_end = min(chunk_start + cls.PREFILL_CHUNK_SIZE, num_prefills)
+                if not swa_only:
+                    chunk_N = int(
+                        torch.max(
+                            seq_lens_cpu[chunk_start:chunk_end]
+                            // layer.compress_ratio
+                        ).item()
+                    )
+                else:
+                    chunk_N = 0
+                chunk_gather = int(
+                    torch.max(gather_lens_cpu[chunk_start:chunk_end]).item()
+                )
+                max_N = max(max_N, chunk_N + chunk_gather)
+            workspace_M = max_N
+        else:
+            workspace_M = default_M
+
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
-            ((cls.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            (
+                (cls.PREFILL_CHUNK_SIZE, workspace_M, q.shape[-1]),
+                torch.bfloat16,
+            ),
         )[0]
+        _log_sparse_prefill_mem_metrics(
+            "workspace_allocated",
+            q.device,
+            dynamic_workspace=dynamic_workspace,
+            num_prefills=int(num_prefills),
+            num_prefill_tokens=int(num_prefill_tokens),
+            prefill_chunk_size=int(cls.PREFILL_CHUNK_SIZE),
+            workspace_M=int(workspace_M),
+            default_M=int(default_M),
+            top_k=int(top_k),
+            compress_ratio=int(layer.compress_ratio),
+            swa_only=bool(swa_only),
+        )
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * cls.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + cls.PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+            if dynamic_workspace:
+                assert seq_lens_cpu is not None
+                assert gather_lens_cpu is not None
+                if not swa_only:
+                    N = int(
+                        torch.max(
+                            seq_lens_cpu[chunk_start:chunk_end]
+                            // layer.compress_ratio
+                        ).item()
+                    )
+                else:
+                    N = 0
+                M = N + int(torch.max(gather_lens_cpu[chunk_start:chunk_end]).item())
+            else:
+                N = default_N
+                M = default_M
+            _log_sparse_prefill_mem_metrics(
+                "chunk_start",
+                q.device,
+                chunk_idx=int(chunk_idx),
+                chunk_size=int(chunk_size),
+                M=int(M),
+                N=int(N),
+                workspace_M=int(workspace_M),
+            )
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
