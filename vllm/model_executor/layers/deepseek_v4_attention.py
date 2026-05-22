@@ -28,6 +28,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+    fused_qnorm_rope_quant_insert_k_cache,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
 
@@ -538,6 +539,32 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
 
+        if current_platform.is_rocm():
+            fused_qnorm_rope_quant_insert_k_cache(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
+        else:
+            # Horizontally fused:
+            #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
+            #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
+            # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
 
 @eager_break_during_capture
 def deepseek_v4_attention(
