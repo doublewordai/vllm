@@ -28,6 +28,39 @@ def _sparse_indexer_debug_enabled() -> bool:
     return os.getenv("DSV4_SPARSE_INDEXER_DEBUG", "0") == "1"
 
 
+def _sparse_prefill_mem_metrics_enabled() -> bool:
+    return os.getenv("DSV4_SPARSE_PREFILL_MEM_METRICS", "0") == "1"
+
+
+def _sparse_prefill_mem_snapshot(device: torch.device) -> dict[str, int]:
+    free, total = torch.cuda.mem_get_info(device)
+    return {
+        "free": int(free),
+        "total": int(total),
+        "allocated": int(torch.cuda.memory_allocated(device)),
+        "reserved": int(torch.cuda.memory_reserved(device)),
+    }
+
+
+def _log_sparse_prefill_mem_metrics(
+    event: str,
+    device: torch.device,
+    **kwargs: int | str | float,
+) -> None:
+    if not _sparse_prefill_mem_metrics_enabled():
+        return
+    record: dict[str, int | str | float] = {
+        "event": event,
+        **_sparse_prefill_mem_snapshot(device),
+        **kwargs,
+    }
+    print(
+        "DSV4_SPARSE_PREFILL_MEM " + json.dumps(record, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _log_sparse_indexer_debug(message: str, device: torch.device) -> None:
     if not _sparse_indexer_debug_enabled():
         return
@@ -600,6 +633,84 @@ def _sparse_prefill_logits_chunk_size() -> int:
     return max(1, _env_int("DSV4_SPARSE_PREFILL_LOGITS_CHUNK_SIZE", 512))
 
 
+@triton.jit
+def _fill_full_window_topk_prefill_kernel(
+    topk_out_ptr,
+    topk_out_stride,
+    cu_seqlen_ks_ptr,
+    cu_seqlen_ke_ptr,
+    topk_tokens: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_start = tl.load(cu_seqlen_ks_ptr + row_id)
+    row_end = tl.load(cu_seqlen_ke_ptr + row_id)
+    row_len = row_end - row_start
+    values = tl.where(offsets < row_len, offsets, -1)
+    tl.store(
+        topk_out_ptr + row_id * topk_out_stride + offsets,
+        values,
+        mask=offsets < topk_tokens,
+    )
+
+
+def _fill_full_window_topk_prefill(
+    topk_out: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    block = 256
+    grid = (topk_out.shape[0], triton.cdiv(topk_tokens, block))
+    _fill_full_window_topk_prefill_kernel[grid](
+        topk_out,
+        topk_out.stride(0),
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_tokens,
+        BLOCK_SIZE=block,
+    )
+
+
+@triton.jit
+def _fill_full_window_topk_decode_kernel(
+    topk_out_ptr,
+    topk_out_stride,
+    seq_lens_ptr,
+    topk_tokens: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    seq_len = tl.load(seq_lens_ptr + row_id)
+    values = tl.where(offsets < seq_len, offsets, -1)
+    tl.store(
+        topk_out_ptr + row_id * topk_out_stride + offsets,
+        values,
+        mask=offsets < topk_tokens,
+    )
+
+
+def _fill_full_window_topk_decode(
+    topk_out: torch.Tensor,
+    seq_lens: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    block = 256
+    seq_lens = seq_lens.reshape(-1)
+    grid = (topk_out.shape[0], triton.cdiv(topk_tokens, block))
+    _fill_full_window_topk_decode_kernel[grid](
+        topk_out,
+        topk_out.stride(0),
+        seq_lens,
+        topk_tokens,
+        BLOCK_SIZE=block,
+    )
+
+
 def _topk_indices_prefill(
     logits: torch.Tensor,
     topk_tokens: int,
@@ -758,6 +869,15 @@ def rocm_aiter_sparse_attn_indexer(
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
         prefill_chunk_size = _sparse_prefill_chunk_size()
+        for chunk_idx, chunk in enumerate(prefill_metadata.chunks):
+            _log_sparse_prefill_mem_metrics(
+                "before_gather",
+                device,
+                chunk=chunk_idx,
+                M=chunk.token_end - chunk.token_start,
+                N=chunk.total_seq_lens,
+                topk=topk_tokens,
+            )
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
                 device=device,
@@ -785,6 +905,14 @@ def rocm_aiter_sparse_attn_indexer(
                     chunk.cu_seq_lens,
                     token_to_seq=chunk.token_to_seq,
                 )
+            _log_sparse_prefill_mem_metrics(
+                "after_gather",
+                device,
+                chunk=chunk_idx,
+                M=chunk.token_end - chunk.token_start,
+                N=chunk.total_seq_lens,
+                topk=topk_tokens,
+            )
 
             chunk_tokens = chunk.token_end - chunk.token_start
             chunk_max_seq_len = getattr(chunk, "max_seq_len", chunk.total_seq_lens)
@@ -803,7 +931,70 @@ def rocm_aiter_sparse_attn_indexer(
                 topk_indices = topk_indices_buffer[
                     token_start:token_end, :topk_tokens
                 ]
+                _log_sparse_prefill_mem_metrics(
+                    "before_topk_select",
+                    device,
+                    chunk=chunk_idx,
+                    row_start=row_start,
+                    rows=row_end - row_start,
+                    N=chunk.total_seq_lens,
+                    topk=topk_tokens,
                 )
+                if chunk_max_seq_len <= topk_tokens:
+                    _fill_full_window_topk_prefill(
+                        topk_indices,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_tokens,
+                    )
+                    _log_sparse_prefill_mem_metrics(
+                        "after_full_window_fill",
+                        device,
+                        chunk=chunk_idx,
+                        row_start=row_start,
+                        rows=row_end - row_start,
+                        N=chunk.total_seq_lens,
+                        topk=topk_tokens,
+                    )
+                else:
+                    logits = rocm_fp8_mqa_logits(
+                        q_fp8[token_start:token_end],
+                        (k_fp8, k_scale.view(torch.float32)),
+                        weights[token_start:token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                    )
+                    _log_sparse_indexer_debug(
+                        "after_logits "
+                        f"M={row_end - row_start} "
+                        f"N={chunk.total_seq_lens}",
+                        device,
+                    )
+                    _log_sparse_prefill_mem_metrics(
+                        "after_logits",
+                        device,
+                        chunk=chunk_idx,
+                        row_start=row_start,
+                        rows=row_end - row_start,
+                        N=chunk.total_seq_lens,
+                        topk=topk_tokens,
+                    )
+                    _topk_indices_prefill(
+                        logits,
+                        topk_tokens,
+                        topk_indices,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                    )
+                    _log_sparse_prefill_mem_metrics(
+                        "after_topk",
+                        device,
+                        chunk=chunk_idx,
+                        row_start=row_start,
+                        rows=row_end - row_start,
+                        N=chunk.total_seq_lens,
+                        topk=topk_tokens,
+                    )
                 _log_sparse_indexer_debug(
                     "after_topk "
                     f"M={row_end - row_start} "
@@ -835,6 +1026,29 @@ def rocm_aiter_sparse_attn_indexer(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+        max_seq_len = getattr(decode_metadata, "max_seq_len", None)
+        if max_seq_len is None:
+            max_seq_len = int(decode_metadata.seq_lens.max().item())
+
+        if max_seq_len <= topk_tokens:
+            _fill_full_window_topk_decode(
+                topk_indices,
+                decode_metadata.seq_lens,
+                topk_tokens,
+            )
+            if decode_metadata.requires_padding:
+                # if padded, we need to unpack
+                # the topk indices removing padded tokens
+                topk_indices = unpack_seq_triton(
+                    topk_indices.reshape(batch_size, next_n, topk_indices.shape[-1]),
+                    decode_lens,
+                )
+                topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
+                    topk_indices
+                )
+            return topk_indices_buffer
 
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
