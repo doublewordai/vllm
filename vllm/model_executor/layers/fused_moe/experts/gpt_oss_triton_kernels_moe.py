@@ -221,6 +221,7 @@ def _patch_make_bitmatrix_metadata() -> None:
         # below without producing any output.
         offs_local = tl.arange(0, BLOCK_SIZE_PADDED)
         offs_global = pid_m * BLOCK_SIZE + offs_local
+        mask = (offs_local < BLOCK_SIZE) & (offs_global < nonzero_indx_size)
         col_indx = tl.load(NonzeroIndx + offs_global, mask=mask, other=-1).to(tl.uint32)
         kv_pairs = ((col_indx << 16) | offs_local).to(tl.uint32)
         kv_pairs = tl.sort(kv_pairs, 0)
