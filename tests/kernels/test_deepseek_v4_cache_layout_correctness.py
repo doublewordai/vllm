@@ -22,6 +22,7 @@ ROPE_DIM = 64
 HEAD_DIM = NOPE_DIM + ROPE_DIM
 QUANT_BLOCK = 64
 SCALE_DIM = 8
+FP8_MAX = torch.finfo(current_platform.fp8_dtype()).max
 TOKEN_DATA_BYTES = NOPE_DIM + ROPE_DIM * 2
 HEAD_BYTES = TOKEN_DATA_BYTES + SCALE_DIM
 SENTINEL = 0xA5
@@ -37,6 +38,9 @@ def _slot_to_offsets(slot: int, block_size: int, block_stride: int) -> tuple[int
 
 
 def _ue8m0_quantize_nope(nope: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    quantized = torch.empty(
+        NOPE_DIM, dtype=current_platform.fp8_dtype(), device="cuda"
+    )
     encoded_scales = torch.zeros(SCALE_DIM, dtype=torch.uint8, device="cuda")
 
     for qblock_idx in range(NOPE_DIM // QUANT_BLOCK):
@@ -47,6 +51,7 @@ def _ue8m0_quantize_nope(nope: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
         exponent = math.ceil(math.log2((amax / FP8_MAX).item()))
         scale = 2.0**exponent
         quantized[start:end] = (block / scale).clamp(-FP8_MAX, FP8_MAX).to(
+            current_platform.fp8_dtype()
         )
         encoded_scales[qblock_idx] = exponent + 127
 
@@ -97,6 +102,7 @@ def _dequantize_reference_token(
     token_base, scale_base = _slot_to_offsets(slot, block_size, k_cache.stride(0))
 
     nope_bytes = cache_flat[token_base : token_base + NOPE_DIM]
+    nope_fp8 = nope_bytes.view(current_platform.fp8_dtype()).float()
     encoded_scales = cache_flat[scale_base : scale_base + SCALE_DIM]
     scales = torch.exp2(encoded_scales[:7].float() - 127.0)
     nope = nope_fp8 * scales.repeat_interleave(QUANT_BLOCK)
