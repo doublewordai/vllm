@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
 from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
@@ -29,15 +30,22 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
 
 
-def _ue8m0_reference(x: torch.Tensor, block_size: int, fp8_max: float):
+def _ue8m0_reference(
+    x: torch.Tensor,
+    block_size: int,
+    fp8_max: float,
+    fp8_dtype: torch.dtype | None = None,
+):
     """PyTorch reference for UE8M0 FP8 quantization (per-block, power-of-2 scale).
 
-    Returns (x_fp8, scales) where x_fp8 is float8_e4m3fn and scales are float32.
+    Returns (x_fp8, scales) where x_fp8 is platform FP8 and scales are float32.
     """
     assert x.dim() == 1
+    if fp8_dtype is None:
+        fp8_dtype = current_platform.fp8_dtype()
     n = x.numel()
     n_blocks = math.ceil(n / block_size)
-    x_fp8 = torch.zeros(n, dtype=torch.float8_e4m3fn, device=x.device)
+    x_fp8 = torch.zeros(n, dtype=fp8_dtype, device=x.device)
     scales = torch.zeros(n_blocks, dtype=torch.float32, device=x.device)
 
     for i in range(n_blocks):
@@ -50,7 +58,7 @@ def _ue8m0_reference(x: torch.Tensor, block_size: int, fp8_max: float):
         scale = 2.0**exponent
         scales[i] = scale
         quantized = (block / scale).clamp(-fp8_max, fp8_max)
-        x_fp8[start:end] = quantized.to(torch.float8_e4m3fn)
+        x_fp8[start:end] = quantized.to(fp8_dtype)
 
     return x_fp8, scales
 
@@ -67,7 +75,7 @@ def test_deepseek_v4_attention_quant_cache_roundtrip(num_tokens: int, block_size
     HEAD_DIM = 512
     NOPE_DIM = 448
     HEAD_BYTES = 584  # 448 fp8 + 128 bf16 + 8 uint8 scale
-    FP8_MAX = 448.0
+    FP8_MAX = torch.finfo(current_platform.fp8_dtype()).max
     QUANT_BLOCK = 64
 
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
@@ -166,7 +174,7 @@ def _dequantize_and_gather_k_cache_reference(
 
             token_data_start = pos_in_block * token_data_size
             fp8_bytes = cache_block[token_data_start : token_data_start + fp8_dim]
-            fp8_vals = fp8_bytes.view(torch.float8_e4m3fn).float()
+            fp8_vals = fp8_bytes.view(current_platform.fp8_dtype()).float()
 
             scale_start = block_size * token_data_size + pos_in_block * scale_dim
             encoded_scales = cache_block[scale_start : scale_start + scale_dim]
@@ -316,7 +324,7 @@ def test_indexer_quant_cache_roundtrip(num_tokens: int, block_size: int):
     )
 
     # ── Manual dequant ──────────────────────────────────────────────────
-    k_fp8 = dst_k.view(torch.float8_e4m3fn).float()  # [num_tokens, 128]
+    k_fp8 = dst_k.view(current_platform.fp8_dtype()).float()  # [num_tokens, 128]
     scale = dst_scale.view(torch.float32)  # [num_tokens, 1]
     k_recovered = k_fp8 * scale  # [num_tokens, 128]
 
@@ -326,8 +334,9 @@ def test_indexer_quant_cache_roundtrip(num_tokens: int, block_size: int):
 
     for t in range(num_tokens):
         amax = k_abs[t].max().clamp(min=1e-4).item()
-        # UE8M0: scale = 2^ceil(log2(amax / 448))
-        exponent = math.ceil(math.log2(amax / 448.0))
+        # UE8M0: scale = 2^ceil(log2(amax / fp8_max))
+        fp8_max = torch.finfo(current_platform.fp8_dtype()).max
+        exponent = math.ceil(math.log2(amax / fp8_max))
         ue8m0_scale = 2.0**exponent
         # FP8 e4m3 (3-bit mantissa): worst-case error = 16 * scale
         max_allowed = 16.0 * ue8m0_scale
@@ -378,9 +387,9 @@ def test_indexer_gather_accepts_upper_bound_output():
     )
     torch.accelerator.synchronize()
 
-    k_recovered = dst_k[:valid_tokens].view(torch.float8_e4m3fn).float() * dst_scale[
-        :valid_tokens
-    ].view(torch.float32)
+    k_recovered = dst_k[:valid_tokens].view(
+        current_platform.fp8_dtype()
+    ).float() * dst_scale[:valid_tokens].view(torch.float32)
     diff = (k_recovered - k.float()).abs()
     max_allowed = (16.0 * dst_scale[:valid_tokens].view(torch.float32).max()).item()
     assert diff.max().item() <= max_allowed
@@ -467,7 +476,7 @@ def _reference_kv_compress_norm_rope(
     overlap: int = 0,
     use_fp4: bool = False,
     rms_eps: float = 1e-6,
-    fp8_max: float = 448.0,
+    fp8_max: float | None = None,
 ):
     """Compress → RMSNorm → GPT-J RoPE → quantize.
 
@@ -475,6 +484,8 @@ def _reference_kv_compress_norm_rope(
     per-element softmax over the scores, and computes the weighted kv sum.
     Returns (quantized_values, scale) matching the kernel's output layout.
     """
+    if fp8_max is None:
+        fp8_max = torch.finfo(current_platform.fp8_dtype()).max
     device = state_cache.device
     head_dim = rms_weight.shape[0]
     rope_dim = cos_sin_cache.shape[-1]
@@ -540,7 +551,7 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
     ROPE_DIM = 64
     BLOCK_SIZE = 16
     RMS_EPS = 1e-6
-    FP8_MAX = 448.0
+    FP8_MAX = torch.finfo(current_platform.fp8_dtype()).max
 
     device = "cuda"
     torch.manual_seed(42)
@@ -618,6 +629,7 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         TOKEN_STRIDE=TOKEN_STRIDE,
         SCALE_DIM=SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        IS_FNUZ=current_platform.is_fp8_fnuz(),
         num_warps=1,
     )
 
