@@ -3,6 +3,7 @@
 
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -39,16 +40,75 @@ logger = init_logger(__name__)
 
 _MOE_SHAPE_DUMP_COUNT = 0
 _MOE_SHAPE_DUMP_WARNED = False
+_ogs_opt_flags = None
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _dsv4_flash_rocm_ogs_constraints(
+    *,
+    m: int,
+    k: int,
+    n: int,
+    e: int,
+    topk: int,
+    activation: MoEActivation,
+) -> dict[str, int] | None:
+    if not current_platform.is_rocm():
+        return None
+    if os.environ.get("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_TUNED", "1") == "0":
+        return None
+
+    # These are the high-throughput DeepSeek-V4-Flash routed-expert shapes on
     # MI300X. The default OGS tile is 128x256x128; measured serving-shaped
     # microbenchmarks are faster with a smaller M tile on CDNA3, including the
     # prefill/ramp shapes seen in the fixed 512/512 benchmark.
+    if (
         m >= 512
+        and k == 4096
+        and n == 4096
+        and e == 128
+        and topk == 6
+        and activation == MoEActivation.SILU
+    ):
         default_block_m = 32 if m < 1024 else 64
+        constraints = {
+            "block_m": _env_int(
                 "VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_BLOCK_M", default_block_m
+            ),
+            "block_n": _env_int("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_BLOCK_N", 128),
+            "block_k": _env_int("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_BLOCK_K", 128),
+        }
         if m >= 1024:
             constraints["epilogue_subtile"] = _env_int(
                 "VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_EPILOGUE_SUBTILE", 16
             )
+        return constraints
+    return None
+
+
+@contextmanager
+def _temporary_ogs_constraints(constraints: dict[str, int] | None):
+    if not constraints or _ogs_opt_flags is None:
+        yield
+        return
+
+    previous = getattr(_ogs_opt_flags, "_opt_flags_constraints", {}).copy()
+    try:
+        _ogs_opt_flags.reset_opt_flags_constraints()
+        if previous:
+            _ogs_opt_flags.update_opt_flags_constraints(previous)
+        _ogs_opt_flags.update_opt_flags_constraints(constraints)
+        yield
+    finally:
+        _ogs_opt_flags.reset_opt_flags_constraints()
+        if previous:
+            _ogs_opt_flags.update_opt_flags_constraints(previous)
 
 
 def _maybe_dump_dsv4_moe_shape(
@@ -333,6 +393,7 @@ use_legacy_triton_kernels = False
 if has_triton_kernels():
     try:
         import triton_kernels.swiglu
+        import triton_kernels.matmul_ogs_details.opt_flags as _ogs_opt_flags
         from triton_kernels.matmul_ogs import (
             FnSpecs,
             FusedActivation,
@@ -990,7 +1051,21 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
 
         gammas = routing_data.gate_scal if routing_data else None
 
+        ogs_constraints = _dsv4_flash_rocm_ogs_constraints(
+            m=M, k=K, n=N, e=E, topk=topk, activation=activation
         )
+        with _temporary_ogs_constraints(ogs_constraints):
+            matmul_ogs(
+                hidden_states,
+                w1,
+                quant_config.w1_bias,
+                routing_data,
+                gather_indx=gather_indx,
+                precision_config=quant_config.w1_precision,
+                gammas=gammas if apply_router_weight_on_input else None,
+                fused_activation=None,
+                y=intermediate_cache1,
+            )
 
         sorted_token_ids_lora = None
         expert_ids_lora = None
@@ -1006,6 +1081,17 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
                 intermediate_cache2,
                 intermediate_cache1.view(-1, N),
             )
+            with _temporary_ogs_constraints(ogs_constraints):
+                matmul_ogs(
+                    intermediate_cache2,
+                    w2,
+                    quant_config.w2_bias,
+                    routing_data,
+                    scatter_indx=scatter_indx,
+                    precision_config=quant_config.w2_precision,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    y=output,
+                )
             return
 
         # w13 LoRA: gather the activation input from expert-sorted
@@ -1042,6 +1128,17 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
         # Set n_expts_act to 1 to unfuse the sum so we can do it manually via moe_sum.
         routing_data.n_expts_act = 1
 
+        with _temporary_ogs_constraints(ogs_constraints):
+            matmul_ogs(
+                intermediate_cache2[gather_indx.src_indx],
+                w2,
+                quant_config.w2_bias,
+                routing_data,
+                scatter_indx=scatter_indx,
+                precision_config=quant_config.w2_precision,
+                gammas=None if apply_router_weight_on_input else gammas,
+                y=intermediate_cache3,
+            )
 
         # w2 LoRA: after matmul_ogs with scatter_indx, intermediate_cache3 is
         # in token-topk order, matching the (M, topk, K) layout add_lora_w2 expects.
