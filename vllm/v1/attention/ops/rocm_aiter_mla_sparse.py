@@ -1283,7 +1283,7 @@ def rocm_inv_rope_einsum(
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
     hidden_dim = o_ref.shape[-1]
-    use_cache = _env_bool_default("DSV4_ROCM_WOA_BF16_WEIGHT_CACHE_DEFAULT", False)
+    use_cache = _env_bool_default("DSV4_ROCM_WOA_BF16_WEIGHT_CACHE_DEFAULT", True)
 
     if hasattr(wo_a, "weight_scale_inv"):
         cache_key = (
