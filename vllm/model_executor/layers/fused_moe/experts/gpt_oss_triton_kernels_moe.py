@@ -61,7 +61,7 @@ def _dsv4_flash_rocm_ogs_constraints(
 ) -> dict[str, int] | None:
     if not current_platform.is_rocm():
         return None
-    if os.environ.get("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_TUNED", "0") == "0":
+    if os.environ.get("VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_TUNED", "1") == "0":
         return None
 
     # These are the high-throughput DeepSeek-V4-Flash routed-expert shapes on
