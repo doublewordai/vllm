@@ -2353,7 +2353,7 @@ def rocm_sparse_attn_decode(
         out=(
             output
             if output.dtype == torch.bfloat16
-            and _env_bool_default("DSV4_SPARSE_ATTN_DECODE_DIRECT_OUT_DEFAULT", False)
+            and _env_bool_default("DSV4_SPARSE_ATTN_DECODE_DIRECT_OUT_DEFAULT", True)
             else None
         ),
     )
