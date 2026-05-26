@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Standalone unit test for the horizontally-fused DeepseekV4-MLA kernel:
+Standalone unit test for the horizontally-fused DeepseekV4-MLA SWA K-cache path:
 
-  fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+  fused_deepseek_v4_qnorm_rope_quant_insert_k_cache on ROCm
+  fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert elsewhere
     - Q side:  per-head RMSNorm (no weight) + GPT-J RoPE on last 64 dims
     - KV side: GPT-J RoPE on last 64 + UE8M0 FP8 quant + paged cache insert
 
@@ -12,15 +13,17 @@ We compare against:
   - Existing Triton `quantize_and_insert_k_cache` + round-trip via
     `dequantize_and_gather_k_cache` for KV
 
-The kernel is imported via
-`torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`.
+ROCm uses the vLLM-owned Triton path because the AITER fused KV branch currently
+scales FNUZ FP8 as if it had E4M3FN's wider finite range.
 """
 
 import pytest
 import torch
 
+from vllm.platforms import current_platform
 from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
+    fused_qnorm_rope_quant_insert_k_cache,
     quantize_and_insert_k_cache,
 )
 
@@ -29,8 +32,10 @@ HEAD_DIM = 512
 ROPE_DIM = 64
 NOPE_DIM = HEAD_DIM - ROPE_DIM  # 448
 QUANT_BLOCK = 64
-FP8_MAX = 448.0
+FP8_MAX = torch.finfo(current_platform.fp8_dtype()).max
 HEAD_BYTES = NOPE_DIM + ROPE_DIM * 2 + 8  # 448 + 128 + 8 = 584
+Q_ATOL = 5e-2 if current_platform.is_rocm() else 1e-2
+Q_RTOL = 5e-2 if current_platform.is_rocm() else 1e-2
 
 
 # ── PyTorch reference implementations ────────────────────────────────────────
@@ -111,6 +116,8 @@ def rmsnorm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _op_available() -> bool:
+    if current_platform.is_rocm():
+        return True
     return hasattr(torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert")
 
 
@@ -121,6 +128,11 @@ pytestmark = pytest.mark.skipif(
 
 
 def _call_fused(q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs):
+    if current_platform.is_rocm():
+        fused_qnorm_rope_quant_insert_k_cache(
+            q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
+        )
+        return
     torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs
     )
@@ -159,7 +171,7 @@ def test_q_path_matches_reference(num_tokens: int, n_heads: int):
     q_fused = q.clone()
     _call_fused(q_fused, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, bs)
 
-    torch.testing.assert_close(q_fused, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(q_fused, q_ref, rtol=Q_RTOL, atol=Q_ATOL)
 
 
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────
@@ -177,7 +189,7 @@ def _ue8m0_per_block_scales(kv_roped_nope_f32: torch.Tensor, qblock: int):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 64, 2048])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     torch.manual_seed(1)
     device = "cuda"
@@ -266,7 +278,7 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
 
 @pytest.mark.parametrize("num_tokens", [4, 17, 2048])
 @pytest.mark.parametrize("pad", [1, 5])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     """slot_mapping.size(0) < q.size(0): the kernel must skip padded
     tokens in the KV branch while still running Q-norm+RoPE on all rows."""
@@ -317,7 +329,7 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 2048])
 @pytest.mark.parametrize("n_heads", [8, 64])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
     torch.manual_seed(2)
     device = "cuda"
@@ -358,5 +370,5 @@ def test_combined_q_and_kv(num_tokens: int, n_heads: int, block_size: int):
         block_size,
     )
 
-    torch.testing.assert_close(q_fused, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(q_fused, q_ref, rtol=Q_RTOL, atol=Q_ATOL)
     torch.testing.assert_close(k_cache_fused, k_cache_ref, rtol=0, atol=0)

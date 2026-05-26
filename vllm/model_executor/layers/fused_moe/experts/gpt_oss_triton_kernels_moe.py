@@ -33,6 +33,16 @@ from ..utils import swiglu_limit_func
 
 logger = init_logger(__name__)
 
+    # MI300X. The default OGS tile is 128x256x128; measured serving-shaped
+    # microbenchmarks are faster with a smaller M tile on CDNA3, including the
+    # prefill/ramp shapes seen in the fixed 512/512 benchmark.
+        m >= 512
+        default_block_m = 32 if m < 1024 else 64
+                "VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_BLOCK_M", default_block_m
+        if m >= 1024:
+            constraints["epilogue_subtile"] = _env_int(
+                "VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_EPILOGUE_SUBTILE", 16
+            )
 
 def _triton_kernel_moe_supports_current_device() -> bool:
     # Shared device gate for the OAI Triton MoE expert classes.
@@ -134,7 +144,7 @@ def _patch_make_bitmatrix_metadata() -> None:
         # below without producing any output.
         offs_local = tl.arange(0, BLOCK_SIZE_PADDED)
         offs_global = pid_m * BLOCK_SIZE + offs_local
-        mask = offs_global < nonzero_indx_size
+        mask = (offs_local < BLOCK_SIZE) & (offs_global < nonzero_indx_size)
         col_indx = tl.load(NonzeroIndx + offs_global, mask=mask, other=-1).to(tl.uint32)
         kv_pairs = ((col_indx << 16) | offs_local).to(tl.uint32)
         kv_pairs = tl.sort(kv_pairs, 0)
@@ -882,69 +892,18 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
 
         gammas = routing_data.gate_scal if routing_data else None
 
-        matmul_ogs(
-            hidden_states,
-            w1,
-            quant_config.w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
-            precision_config=quant_config.w1_precision,
-            gammas=gammas if apply_router_weight_on_input else None,
-            fused_activation=None,
-            y=intermediate_cache1,
         )
-
-        # w13 LoRA: gather the activation input from expert-sorted
-        # intermediate_cache1, then add the LoRA delta in-place on that copy
-        # before passing it to activation — exactly mirroring the old
-        # decorator approach which modified the gathered tensor in-place.
-        act_input = intermediate_cache1.view(-1, N)[gather_indx.dst_indx]
 
         sorted_token_ids_lora = None
         expert_ids_lora = None
         num_tokens_post_padded_lora = None
         token_lora_mapping = None
         lora_context = self._lora_context
-        if lora_context is not None:
-            (
-                sorted_token_ids_lora,
-                expert_ids_lora,
-                num_tokens_post_padded_lora,
-                token_lora_mapping,
-            ) = self.apply_w13_lora(
-                lora_context,
-                y=act_input,
-                x=hidden_states,
-                topk_ids=global_topk_ids,
-                topk_weights=topk_weights,
-                expert_map=expert_map,
-                w1=w1,
-                w2=w2,
-                num_tokens=M,
-                top_k_num=topk,
-            )
-
-        self.activation(
-            activation,
-            intermediate_cache2,
-            act_input,
-        )
-
         # matmul_ogs grouped reduction fuses sum across multiple experts:
         # y[dst_indx // n_expts_act, :] += x
         # Set n_expts_act to 1 to unfuse the sum so we can do it manually via moe_sum.
         routing_data.n_expts_act = 1
 
-        matmul_ogs(
-            intermediate_cache2[gather_indx.src_indx],
-            w2,
-            quant_config.w2_bias,
-            routing_data,
-            scatter_indx=scatter_indx,
-            precision_config=quant_config.w2_precision,
-            gammas=None if apply_router_weight_on_input else gammas,
-            y=intermediate_cache3,
-        )
 
         # w2 LoRA: after matmul_ogs with scatter_indx, intermediate_cache3 is
         # in token-topk order, matching the (M, topk, K) layout add_lora_w2 expects.

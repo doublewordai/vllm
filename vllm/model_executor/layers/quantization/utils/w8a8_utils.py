@@ -125,7 +125,23 @@ def normalize_e4m3fn_to_e4m3fnuz(
     # the e4m3fn value, so we should double the scaling factor to
     # get the same dequantized value.
     # https://onnx.ai/onnx/technical/float8.html
-    weight_scale = weight_scale * 2.0
+    if weight_scale.dtype == torch.float8_e8m0fnu:
+        weight_scale_as_uint8 = weight_scale.view(torch.uint8)
+        weight_scale = (
+            torch.clamp(weight_scale_as_uint8.to(torch.int16) + 1, max=255)
+            .to(torch.uint8)
+            .view(torch.float8_e8m0fnu)
+        )
+    else:
+        weight_scale = weight_scale * 2.0
     if input_scale is not None:
-        input_scale = input_scale * 2.0
+        if input_scale.dtype == torch.float8_e8m0fnu:
+            input_scale_as_uint8 = input_scale.view(torch.uint8)
+            input_scale = (
+                torch.clamp(input_scale_as_uint8.to(torch.int16) + 1, max=255)
+                .to(torch.uint8)
+                .view(torch.float8_e8m0fnu)
+            )
+        else:
+            input_scale = input_scale * 2.0
     return weight, weight_scale, input_scale
