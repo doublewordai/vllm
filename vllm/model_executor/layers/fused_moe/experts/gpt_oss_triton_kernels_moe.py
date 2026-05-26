@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+from pathlib import Path
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -33,6 +37,8 @@ from ..utils import swiglu_limit_func
 
 logger = init_logger(__name__)
 
+_MOE_SHAPE_DUMP_COUNT = 0
+_MOE_SHAPE_DUMP_WARNED = False
     # MI300X. The default OGS tile is 128x256x128; measured serving-shaped
     # microbenchmarks are faster with a smaller M tile on CDNA3, including the
     # prefill/ramp shapes seen in the fixed 512/512 benchmark.
@@ -43,6 +49,88 @@ logger = init_logger(__name__)
             constraints["epilogue_subtile"] = _env_int(
                 "VLLM_ROCM_DSV4_FLASH_MXFP4_OGS_EPILOGUE_SUBTILE", 16
             )
+
+
+def _maybe_dump_dsv4_moe_shape(
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk: int,
+    activation: MoEActivation,
+    global_num_experts: int,
+) -> None:
+    dump_dir = os.environ.get("DSV4_MOE_SHAPE_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    # Host copies inside graph capture are illegal on ROCm and would also
+    # perturb the graph. Shape collection is an eager/profiling-only mode.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+
+    global _MOE_SHAPE_DUMP_COUNT
+    limit = int(os.environ.get("DSV4_MOE_SHAPE_DUMP_LIMIT", "0") or "0")
+    if limit > 0 and _MOE_SHAPE_DUMP_COUNT >= limit:
+        return
+
+    stride = max(1, int(os.environ.get("DSV4_MOE_SHAPE_DUMP_STRIDE", "1") or "1"))
+    _MOE_SHAPE_DUMP_COUNT += 1
+    if (_MOE_SHAPE_DUMP_COUNT - 1) % stride != 0:
+        return
+
+    min_m = int(os.environ.get("DSV4_MOE_SHAPE_DUMP_MIN_M", "0") or "0")
+    M, K = hidden_states.shape
+    if M < min_m:
+        return
+
+    try:
+        local_num_experts = int(w1.shape[0])
+        valid_topk = topk_ids[topk_ids >= 0].reshape(-1)
+        hist = torch.bincount(
+            valid_topk.to(torch.int64), minlength=local_num_experts
+        )[:local_num_experts].cpu()
+        nonzero = hist[hist > 0]
+        if nonzero.numel() == 0:
+            p90_nonzero = 0
+            hist_max = 0
+        else:
+            p90_nonzero = int(
+                torch.quantile(nonzero.float(), 0.9).round().item()
+            )
+            hist_max = int(nonzero.max().item())
+
+        rec = {
+            "pid": os.getpid(),
+            "rank": os.environ.get("RANK"),
+            "local_rank": os.environ.get("LOCAL_RANK"),
+            "count": _MOE_SHAPE_DUMP_COUNT,
+            "activation": activation.name,
+            "M": int(M),
+            "K": int(K),
+            "topk": int(topk),
+            "global_num_experts": int(global_num_experts),
+            "local_num_experts": local_num_experts,
+            "w1_shape": list(w1.shape),
+            "w2_shape": list(w2.shape),
+            "hist_sum": int(hist.sum().item()),
+            "hist_nonzero": int(nonzero.numel()),
+            "hist_max": hist_max,
+            "p90_nonzero": p90_nonzero,
+            "hist": [int(x) for x in hist.tolist()],
+        }
+        path = Path(dump_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        filename = f"moe_shapes_rank{rec['rank'] or 'x'}_pid{os.getpid()}.jsonl"
+        with (path / filename).open("a") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception as e:
+        global _MOE_SHAPE_DUMP_WARNED
+        if not _MOE_SHAPE_DUMP_WARNED:
+            _MOE_SHAPE_DUMP_WARNED = True
+            logger.warning("Failed to dump DeepSeek V4 MoE shape: %s", e)
+
 
 def _triton_kernel_moe_supports_current_device() -> bool:
     # Shared device gate for the OAI Triton MoE expert classes.
@@ -884,6 +972,16 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
         if global_num_experts == -1:
             global_num_experts = E
 
+        _maybe_dump_dsv4_moe_shape(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_ids=topk_ids,
+            topk=topk,
+            activation=activation,
+            global_num_experts=global_num_experts,
+        )
+
         # Note that the output tensor might be in workspace13
         intermediate_cache1 = _resize_cache(workspace2, (batch_dim, M * topk, N))
         intermediate_cache3 = _resize_cache(workspace2, (batch_dim, M * topk, K))
@@ -899,6 +997,46 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
         num_tokens_post_padded_lora = None
         token_lora_mapping = None
         lora_context = self._lora_context
+        if lora_context is None:
+            # W1 writes in expert-sorted order. The old no-LoRA path gathered
+            # back to token-topk order for activation, then gathered back to
+            # expert-sorted order for W2; those two gathers cancel.
+            self.activation(
+                activation,
+                intermediate_cache2,
+                intermediate_cache1.view(-1, N),
+            )
+            return
+
+        # w13 LoRA: gather the activation input from expert-sorted
+        # intermediate_cache1, then add the LoRA delta in-place on that copy
+        # before passing it to activation — exactly mirroring the old
+        # decorator approach which modified the gathered tensor in-place.
+        act_input = intermediate_cache1.view(-1, N)[gather_indx.dst_indx]
+        (
+            sorted_token_ids_lora,
+            expert_ids_lora,
+            num_tokens_post_padded_lora,
+            token_lora_mapping,
+        ) = self.apply_w13_lora(
+            lora_context,
+            y=act_input,
+            x=hidden_states,
+            topk_ids=global_topk_ids,
+            topk_weights=topk_weights,
+            expert_map=expert_map,
+            w1=w1,
+            w2=w2,
+            num_tokens=M,
+            top_k_num=topk,
+        )
+
+        self.activation(
+            activation,
+            intermediate_cache2,
+            act_input,
+        )
+
         # matmul_ogs grouped reduction fuses sum across multiple experts:
         # y[dst_indx // n_expts_act, :] += x
         # Set n_expts_act to 1 to unfuse the sum so we can do it manually via moe_sum.
