@@ -137,6 +137,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import MoriAll2AllManager
 
                 self.all2all_manager = MoriAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "pplx_garden":
+                from .all2all import PplxGardenAll2AllManager
+
+                self.all2all_manager = PplxGardenAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
             elif self.all2all_backend == "nixl_ep":
                 from .all2all import NixlEPAll2AllManager
 
@@ -270,7 +276,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         input_tensor = input_.movedim(0, dim).contiguous()
 
         if sizes is not None:
-            assert len(sizes) == world_size
+            assert len(sizes) == world_size, f"{len(sizes)} == {world_size}"
             assert input_tensor.shape[0] == sum(sizes)
             chunk_size = sizes[self.rank_in_group]
         else:
