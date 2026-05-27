@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    build_ragged_indices_from_dense,
     build_ragged_indices_from_dense_out,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
@@ -41,6 +42,13 @@ if TYPE_CHECKING:
 
 def _env_flag(name: str) -> bool:
     return os.getenv(name, "0") == "1"
+
+
+def _env_bool_default(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value not in ("0", "false", "False", "no", "No")
 
 
 def _log_sparse_prefill_mem_metrics(
@@ -506,13 +514,20 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
         if dense_decode is not None and decode_lens is not None:
             assert self.c128a_decode_topk_ragged_indices_buffer is not None
             assert self.c128a_decode_topk_ragged_indptr_buffer is not None
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
-                dense_decode.reshape(dense_decode.shape[0], -1),
-                decode_lens,
-                self.c128a_decode_topk_ragged_indices_buffer,
-                self.c128a_decode_topk_ragged_indptr_buffer,
-                max_entries_per_row=self.c128a_max_compressed,
-            )
+            dense_decode_2d = dense_decode.reshape(dense_decode.shape[0], -1)
+            if _env_bool_default("DSV4_STATIC_DECODE_RAGGED_METADATA_DEFAULT", False):
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
+                    dense_decode_2d,
+                    decode_lens,
+                    self.c128a_decode_topk_ragged_indices_buffer,
+                    self.c128a_decode_topk_ragged_indptr_buffer,
+                    max_entries_per_row=self.c128a_max_compressed,
+                )
+            else:
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                    dense_decode_2d,
+                    decode_lens,
+                )
 
         return DeepseekV4ROCMAiterMLASparseMetadata(
             **vars(base),
@@ -555,13 +570,20 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
-                base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
-                base.decode_swa_lens,
-                self.decode_swa_ragged_indices_buffer,
-                self.decode_swa_ragged_indptr_buffer,
-                max_entries_per_row=self.window_size,
-            )
+            decode_swa_2d = base.decode_swa_indices.reshape(base.num_decode_tokens, -1)
+            if _env_bool_default("DSV4_STATIC_DECODE_RAGGED_METADATA_DEFAULT", False):
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
+                    decode_swa_2d,
+                    base.decode_swa_lens,
+                    self.decode_swa_ragged_indices_buffer,
+                    self.decode_swa_ragged_indptr_buffer,
+                    max_entries_per_row=self.window_size,
+                )
+            else:
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                    decode_swa_2d,
+                    base.decode_swa_lens,
+                )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(
             **vars(base),

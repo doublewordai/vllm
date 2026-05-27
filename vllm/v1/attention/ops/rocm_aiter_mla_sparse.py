@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import importlib
+import json
 import math
+import os
 import sys
 from importlib.util import find_spec
 
@@ -24,8 +26,68 @@ else:
     _ON_GFX950 = False
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_int_or_none(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _env_bool_default(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value not in ("0", "false", "False", "no", "No")
+
+
 def _sparse_indexer_debug_enabled() -> bool:
     return os.getenv("DSV4_SPARSE_INDEXER_DEBUG", "0") == "1"
+
+
+def _sparse_prefill_mem_metrics_enabled() -> bool:
+    return os.getenv("DSV4_SPARSE_PREFILL_MEM_METRICS", "0") == "1"
+
+
+def _sparse_prefill_mem_snapshot(device: torch.device) -> dict[str, int]:
+    free, total = torch.cuda.mem_get_info(device)
+    return {
+        "free": int(free),
+        "total": int(total),
+        "allocated": int(torch.cuda.memory_allocated(device)),
+        "reserved": int(torch.cuda.memory_reserved(device)),
+    }
+
+
+def _log_sparse_prefill_mem_metrics(
+    event: str,
+    device: torch.device,
+    **kwargs: int | str | float,
+) -> None:
+    if not _sparse_prefill_mem_metrics_enabled():
+        return
+    record: dict[str, int | str | float] = {
+        "event": event,
+        **_sparse_prefill_mem_snapshot(device),
+        **kwargs,
+    }
+    print(
+        "DSV4_SPARSE_PREFILL_MEM " + json.dumps(record, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _log_sparse_indexer_debug(message: str, device: torch.device) -> None:
@@ -38,6 +100,61 @@ def _log_sparse_indexer_debug(message: str, device: torch.device) -> None:
         file=sys.stderr,
         flush=True,
     )
+
+
+def _select_sparse_decode_config(
+    num_queries: int,
+    head_dim: int,
+    extra_indices: torch.Tensor,
+) -> tuple[int, int, int]:
+    block_h_override = _env_int_or_none("DSV4_SPARSE_ATTN_DECODE_BLOCK_H")
+    block_k_override = _env_int_or_none("DSV4_SPARSE_ATTN_DECODE_BLOCK_K")
+    num_warps_override = _env_int_or_none("DSV4_SPARSE_ATTN_DECODE_NUM_WARPS")
+
+    block_h = 16
+    block_k = 16 if head_dim >= 256 else 32
+    num_warps = 4
+
+    if (
+        block_h_override is None
+        and block_k_override is None
+        and num_warps_override is None
+        and not _env_bool_default("DSV4_SPARSE_ATTN_DECODE_DYNAMIC_DEFAULT", False)
+    ):
+        return block_h, block_k, num_warps
+
+    extra_per_query = (
+        extra_indices.numel() // num_queries if num_queries > 0 else 0
+    )
+    if extra_per_query <= 8:
+        if num_queries >= 256:
+            block_h, block_k = 64, 16
+            if extra_per_query > 0:
+                num_warps = 8
+        elif num_queries >= 80:
+            block_h, block_k = 32, 16
+        elif num_queries == 32:
+            block_h, block_k = 16, 16
+        else:
+            block_h, block_k = 16, 32
+    else:
+        if num_queries < 32:
+            block_h, block_k = 4, 64
+        elif num_queries >= 256:
+            block_h, block_k = 64, 16
+            num_warps = 8
+        elif num_queries >= 80:
+            block_h, block_k = 32, 16
+        else:
+            block_h, block_k = 16, 32
+
+    if block_h_override is not None:
+        block_h = block_h_override
+    if block_k_override is not None:
+        block_k = block_k_override
+    if num_warps_override is not None:
+        num_warps = num_warps_override
+    return block_h, block_k, num_warps
 
 
 @triton.jit
@@ -627,6 +744,84 @@ def _sparse_prefill_logits_chunk_size() -> int:
     return max(1, _env_int("DSV4_SPARSE_PREFILL_LOGITS_CHUNK_SIZE", 512))
 
 
+@triton.jit
+def _fill_full_window_topk_prefill_kernel(
+    topk_out_ptr,
+    topk_out_stride,
+    cu_seqlen_ks_ptr,
+    cu_seqlen_ke_ptr,
+    topk_tokens: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row_start = tl.load(cu_seqlen_ks_ptr + row_id)
+    row_end = tl.load(cu_seqlen_ke_ptr + row_id)
+    row_len = row_end - row_start
+    values = tl.where(offsets < row_len, offsets, -1)
+    tl.store(
+        topk_out_ptr + row_id * topk_out_stride + offsets,
+        values,
+        mask=offsets < topk_tokens,
+    )
+
+
+def _fill_full_window_topk_prefill(
+    topk_out: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    block = 256
+    grid = (topk_out.shape[0], triton.cdiv(topk_tokens, block))
+    _fill_full_window_topk_prefill_kernel[grid](
+        topk_out,
+        topk_out.stride(0),
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_tokens,
+        BLOCK_SIZE=block,
+    )
+
+
+@triton.jit
+def _fill_full_window_topk_decode_kernel(
+    topk_out_ptr,
+    topk_out_stride,
+    seq_lens_ptr,
+    topk_tokens: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    seq_len = tl.load(seq_lens_ptr + row_id)
+    values = tl.where(offsets < seq_len, offsets, -1)
+    tl.store(
+        topk_out_ptr + row_id * topk_out_stride + offsets,
+        values,
+        mask=offsets < topk_tokens,
+    )
+
+
+def _fill_full_window_topk_decode(
+    topk_out: torch.Tensor,
+    seq_lens: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    block = 256
+    seq_lens = seq_lens.reshape(-1)
+    grid = (topk_out.shape[0], triton.cdiv(topk_tokens, block))
+    _fill_full_window_topk_decode_kernel[grid](
+        topk_out,
+        topk_out.stride(0),
+        seq_lens,
+        topk_tokens,
+        BLOCK_SIZE=block,
+    )
+
+
 def _topk_indices_prefill(
     logits: torch.Tensor,
     topk_tokens: int,
@@ -785,6 +980,15 @@ def rocm_aiter_sparse_attn_indexer(
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
         prefill_chunk_size = _sparse_prefill_chunk_size()
+        for chunk_idx, chunk in enumerate(prefill_metadata.chunks):
+            _log_sparse_prefill_mem_metrics(
+                "before_gather",
+                device,
+                chunk=chunk_idx,
+                M=chunk.token_end - chunk.token_start,
+                N=chunk.total_seq_lens,
+                topk=topk_tokens,
+            )
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
                 device=device,
@@ -812,6 +1016,14 @@ def rocm_aiter_sparse_attn_indexer(
                     chunk.cu_seq_lens,
                     token_to_seq=chunk.token_to_seq,
                 )
+            _log_sparse_prefill_mem_metrics(
+                "after_gather",
+                device,
+                chunk=chunk_idx,
+                M=chunk.token_end - chunk.token_start,
+                N=chunk.total_seq_lens,
+                topk=topk_tokens,
+            )
 
             chunk_tokens = chunk.token_end - chunk.token_start
             chunk_max_seq_len = getattr(chunk, "max_seq_len", chunk.total_seq_lens)
@@ -830,7 +1042,70 @@ def rocm_aiter_sparse_attn_indexer(
                 topk_indices = topk_indices_buffer[
                     token_start:token_end, :topk_tokens
                 ]
+                _log_sparse_prefill_mem_metrics(
+                    "before_topk_select",
+                    device,
+                    chunk=chunk_idx,
+                    row_start=row_start,
+                    rows=row_end - row_start,
+                    N=chunk.total_seq_lens,
+                    topk=topk_tokens,
                 )
+                if chunk_max_seq_len <= topk_tokens:
+                    _fill_full_window_topk_prefill(
+                        topk_indices,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_tokens,
+                    )
+                    _log_sparse_prefill_mem_metrics(
+                        "after_full_window_fill",
+                        device,
+                        chunk=chunk_idx,
+                        row_start=row_start,
+                        rows=row_end - row_start,
+                        N=chunk.total_seq_lens,
+                        topk=topk_tokens,
+                    )
+                else:
+                    logits = rocm_fp8_mqa_logits(
+                        q_fp8[token_start:token_end],
+                        (k_fp8, k_scale.view(torch.float32)),
+                        weights[token_start:token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                    )
+                    _log_sparse_indexer_debug(
+                        "after_logits "
+                        f"M={row_end - row_start} "
+                        f"N={chunk.total_seq_lens}",
+                        device,
+                    )
+                    _log_sparse_prefill_mem_metrics(
+                        "after_logits",
+                        device,
+                        chunk=chunk_idx,
+                        row_start=row_start,
+                        rows=row_end - row_start,
+                        N=chunk.total_seq_lens,
+                        topk=topk_tokens,
+                    )
+                    _topk_indices_prefill(
+                        logits,
+                        topk_tokens,
+                        topk_indices,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                    )
+                    _log_sparse_prefill_mem_metrics(
+                        "after_topk",
+                        device,
+                        chunk=chunk_idx,
+                        row_start=row_start,
+                        rows=row_end - row_start,
+                        N=chunk.total_seq_lens,
+                        topk=topk_tokens,
+                    )
                 _log_sparse_indexer_debug(
                     "after_topk "
                     f"M={row_end - row_start} "
@@ -862,6 +1137,29 @@ def rocm_aiter_sparse_attn_indexer(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+        max_seq_len = getattr(decode_metadata, "max_seq_len", None)
+        if max_seq_len is None:
+            max_seq_len = int(decode_metadata.seq_lens.max().item())
+
+        if max_seq_len <= topk_tokens:
+            _fill_full_window_topk_decode(
+                topk_indices,
+                decode_metadata.seq_lens,
+                topk_tokens,
+            )
+            if decode_metadata.requires_padding:
+                # if padded, we need to unpack
+                # the topk indices removing padded tokens
+                topk_indices = unpack_seq_triton(
+                    topk_indices.reshape(batch_size, next_n, topk_indices.shape[-1]),
+                    decode_lens,
+                )
+                topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
+                    topk_indices
+                )
+            return topk_indices_buffer
 
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
@@ -985,11 +1283,45 @@ def rocm_inv_rope_einsum(
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
     hidden_dim = o_ref.shape[-1]
+    use_cache = _env_bool_default("DSV4_ROCM_WOA_BF16_WEIGHT_CACHE_DEFAULT", False)
+
     if hasattr(wo_a, "weight_scale_inv"):
+        cache_key = (
+            n_local_groups,
             o_lora_rank,
             hidden_dim,
+            wo_a.weight.data_ptr(),
+            wo_a.weight_scale_inv.data_ptr(),
         )
+        cached_key = getattr(wo_a, "_vllm_rocm_bf16_weight_key", None)
+        wo_a_weight = getattr(wo_a, "_vllm_rocm_bf16_weight_cache", None)
+        if (not use_cache) or cached_key != cache_key or wo_a_weight is None:
+            weight_fp32 = wo_a.weight.view(
+                n_local_groups, o_lora_rank, hidden_dim
+            ).to(torch.float32)
+            wo_a_scale = _expand_2d_block_scales(
+                wo_a.weight_scale_inv.view(
+                    n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
+                ),
+                o_lora_rank,
+                hidden_dim,
+            )
+            wo_a_weight = (weight_fp32 * wo_a_scale).to(torch.bfloat16)
+            if use_cache:
+                wo_a._vllm_rocm_bf16_weight_cache = wo_a_weight
+                wo_a._vllm_rocm_bf16_weight_key = cache_key
     else:
+        cache_key = (n_local_groups, o_lora_rank, hidden_dim, wo_a.weight.data_ptr())
+        cached_key = getattr(wo_a, "_vllm_rocm_bf16_weight_key", None)
+        wo_a_weight = getattr(wo_a, "_vllm_rocm_bf16_weight_cache", None)
+        if (not use_cache) or cached_key != cache_key or wo_a_weight is None:
+            wo_a_weight = wo_a.weight.view(
+                n_local_groups, o_lora_rank, hidden_dim
+            ).to(torch.bfloat16)
+            if use_cache:
+                wo_a._vllm_rocm_bf16_weight_cache = wo_a_weight
+                wo_a._vllm_rocm_bf16_weight_key = cache_key
+
     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
 
 
@@ -1013,6 +1345,125 @@ def _validate_dsv4_sparse_dims(
         f"{op_name} expects {_DSV4_SPARSE_NOPE_DIM} NoPE dims and "
         f"{_DSV4_SPARSE_ROPE_DIM} RoPE dims"
     )
+
+
+_DSV4_SPARSE_DECODE_SHAPE_CALLS = 0
+
+
+def _shape_dump_limit() -> int:
+    return _env_int("DSV4_SPARSE_DECODE_SHAPE_DUMP_LIMIT", 0)
+
+
+def _shape_dump_stride() -> int:
+    return max(1, _env_int("DSV4_SPARSE_DECODE_SHAPE_DUMP_STRIDE", 1))
+
+
+def _tensor_shape(x: torch.Tensor | None) -> list[int] | None:
+    return None if x is None else list(x.shape)
+
+
+def _tensor_stride(x: torch.Tensor | None) -> list[int] | None:
+    return None if x is None else list(x.stride())
+
+
+def _length_summary(x: torch.Tensor | None) -> dict[str, object] | None:
+    if x is None:
+        return None
+    flat = x.detach().to("cpu", dtype=torch.int64).reshape(-1)
+    if flat.numel() == 0:
+        return {
+            "numel": 0,
+            "sum": 0,
+            "min": 0,
+            "max": 0,
+            "mean": 0.0,
+            "hist": [],
+        }
+    values, counts = torch.unique(flat, sorted=True, return_counts=True)
+    return {
+        "numel": int(flat.numel()),
+        "sum": int(flat.sum().item()),
+        "min": int(flat.min().item()),
+        "max": int(flat.max().item()),
+        "mean": float(flat.float().mean().item()),
+        "hist": [
+            [int(v.item()), int(c.item())] for v, c in zip(values, counts)
+        ],
+    }
+
+
+def _indptr_length_summary(indptr: torch.Tensor | None) -> dict[str, object] | None:
+    if indptr is None:
+        return None
+    return _length_summary(indptr[1:] - indptr[:-1])
+
+
+def _maybe_dump_sparse_decode_shape(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    swa_k_cache: torch.Tensor,
+    swa_only: bool,
+    topk_indices: torch.Tensor | None,
+    topk_lens: torch.Tensor | None,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_ragged_indices: torch.Tensor | None,
+    swa_ragged_indptr: torch.Tensor | None,
+    topk_ragged_indices: torch.Tensor | None,
+    topk_ragged_indptr: torch.Tensor | None,
+    output: torch.Tensor,
+) -> None:
+    dump_dir = os.getenv("DSV4_SPARSE_DECODE_SHAPE_DUMP_DIR", "")
+    if not dump_dir:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    global _DSV4_SPARSE_DECODE_SHAPE_CALLS
+    call_idx = _DSV4_SPARSE_DECODE_SHAPE_CALLS
+    _DSV4_SPARSE_DECODE_SHAPE_CALLS += 1
+
+    limit = _shape_dump_limit()
+    stride = _shape_dump_stride()
+    if limit and call_idx >= limit:
+        return
+    if call_idx % stride != 0:
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    main_ragged_lens = _indptr_length_summary(swa_ragged_indptr)
+    extra_ragged_lens = _indptr_length_summary(topk_ragged_indptr)
+    record = {
+        "call_idx": call_idx,
+        "pid": os.getpid(),
+        "rank": os.getenv("RANK"),
+        "local_rank": os.getenv("LOCAL_RANK"),
+        "q_shape": _tensor_shape(q),
+        "q_stride": _tensor_stride(q),
+        "q_dtype": str(q.dtype),
+        "output_shape": _tensor_shape(output),
+        "output_stride": _tensor_stride(output),
+        "output_dtype": str(output.dtype),
+        "swa_only": bool(swa_only),
+        "swa_cache_shape": _tensor_shape(swa_k_cache),
+        "swa_cache_stride": _tensor_stride(swa_k_cache),
+        "kv_cache_shape": _tensor_shape(kv_cache),
+        "kv_cache_stride": _tensor_stride(kv_cache),
+        "swa_indices_shape": _tensor_shape(swa_indices),
+        "topk_indices_shape": _tensor_shape(topk_indices),
+        "swa_ragged_indices_shape": _tensor_shape(swa_ragged_indices),
+        "topk_ragged_indices_shape": _tensor_shape(topk_ragged_indices),
+        "swa_lens": _length_summary(swa_lens),
+        "topk_lens": _length_summary(topk_lens),
+        "swa_ragged_lens": main_ragged_lens,
+        "topk_ragged_lens": extra_ragged_lens,
+        "effective_swa_lens": main_ragged_lens or _length_summary(swa_lens),
+        "effective_topk_lens": extra_ragged_lens or _length_summary(topk_lens),
+    }
+    path = os.path.join(dump_dir, f"sparse_decode_shapes_{os.getpid()}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 @triton.jit
@@ -1500,6 +1951,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     attn_sink: torch.Tensor | None,
     nope_head_dim: int,
     rope_head_dim: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
@@ -1529,6 +1981,11 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
     block_k = 16 if head_dim >= 256 else 32
+    if out is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    else:
+        assert out.shape == q.shape, f"expected out shape {q.shape}, got {out.shape}"
+        assert out.dtype == torch.bfloat16, f"expected bf16 out, got {out.dtype}"
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
@@ -1598,6 +2055,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -1658,6 +2116,16 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
+    block_h, block_k, num_warps = _select_sparse_decode_config(
+        num_queries,
+        head_dim,
+        extra_indices,
+    )
+    if out is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    else:
+        assert out.shape == q.shape, f"expected out shape {q.shape}, got {out.shape}"
+        assert out.dtype == torch.bfloat16, f"expected bf16 out, got {out.dtype}"
     _sparse_attn_decode_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         main_cache,
@@ -1688,6 +2156,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         IS_FNUZ=current_platform.is_fp8_fnuz(),
         BLOCK_H=block_h,
         BLOCK_K=block_k,
+        num_warps=num_warps,
     )
     return out
 
@@ -1708,6 +2177,7 @@ def _rocm_sparse_attn_decode_triton(
     main_ragged_indptr: torch.Tensor | None = None,
     extra_ragged_indices: torch.Tensor | None = None,
     extra_ragged_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -1743,6 +2213,7 @@ def _rocm_sparse_attn_decode_triton(
         extra_cache=extra_cache,
         extra_indices=extra_ragged_indices,
         extra_indptr=extra_ragged_indptr,
+        out=out,
     )
 
 
@@ -1771,6 +2242,7 @@ def rocm_sparse_attn_prefill(
     )
 
     if ragged_indices is not None and ragged_indptr is not None:
+        direct_out = output if output.dtype == torch.bfloat16 else None
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
             kv=kv.squeeze(1),
@@ -1780,6 +2252,7 @@ def rocm_sparse_attn_prefill(
             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
+            out=direct_out,
         )
     else:
         indices_2d = indices.reshape(indices.shape[0], -1)
@@ -1793,6 +2266,8 @@ def rocm_sparse_attn_prefill(
             rope_head_dim=rope_head_dim,
             topk_length=topk_length,
         )
+    if output_chunk is not output:
+        output.copy_(output_chunk.to(output.dtype))
 
 
 def rocm_sparse_attn_decode(
@@ -1843,6 +2318,22 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
+    _maybe_dump_sparse_decode_shape(
+        q=q,
+        kv_cache=kv_cache,
+        swa_k_cache=swa_k_cache,
+        swa_only=swa_only,
+        topk_indices=topk_indices,
+        topk_lens=topk_lens,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        swa_ragged_indices=swa_ragged_indices,
+        swa_ragged_indptr=swa_ragged_indptr,
+        topk_ragged_indices=topk_ragged_indices,
+        topk_ragged_indptr=topk_ragged_indptr,
+        output=output,
+    )
+
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,
@@ -1859,4 +2350,12 @@ def rocm_sparse_attn_decode(
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
         extra_ragged_indptr=topk_ragged_indptr,
+        out=(
+            output
+            if output.dtype == torch.bfloat16
+            and _env_bool_default("DSV4_SPARSE_ATTN_DECODE_DIRECT_OUT_DEFAULT", False)
+            else None
+        ),
     )
+    if attn_out is not output:
+        output.copy_(attn_out.to(output.dtype))

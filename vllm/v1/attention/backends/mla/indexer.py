@@ -173,6 +173,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     cu_seq_lens: torch.Tensor
     token_to_seq: torch.Tensor
     total_seq_lens: int
+    max_seq_len: int
     token_start: int
     token_end: int
     num_reqs: int
@@ -192,6 +193,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     #   - native MTP path: 2D (B, next_n) where [b,j] = L_b - next_n + j + 1
     # Both fp8_fp4_paged_mqa_logits and the topk kernels accept both shapes.
     seq_lens: torch.Tensor
+    max_seq_len: int
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
@@ -553,6 +555,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
+            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
             torch.diff(
                 common_attn_metadata.query_start_loc[: num_decodes + 1],
                 out=self.decode_lens_buffer[:num_decodes],
@@ -563,6 +566,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
 
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound[:num_decodes]
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
 
             max_decode_len = int(decode_lens_cpu.max().item())
@@ -587,6 +591,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # For DeepseekV4 (compress_ratio > 1), the indexer KV cache stores
             # compressed tokens. Convert uncompressed seq_lens to compressed.
             if self.compress_ratio > 1:
+                seq_lens_cpu = seq_lens_cpu // self.compress_ratio
                 # True iff seq_lens aliases decode_seq_lens_buffer (flatten or
                 # native wrote it); False iff it aliases common_attn_metadata.
                 seq_lens_is_local_view = (use_native and next_n > 1) or (
@@ -619,6 +624,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
+                max_seq_len=int(seq_lens_cpu.max().item()),
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
@@ -655,6 +661,7 @@ def build_prefill_chunk_metadata(
     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
     if total_seq_lens == 0:
         return None
+    max_seq_len = int(compressed_seq_lens_cpu[start_idx:end_idx].max().item())
 
     num_reqs = end_idx - start_idx
     device = block_table.device
@@ -710,6 +717,7 @@ def build_prefill_chunk_metadata(
         cu_seq_lens=cu_seq_lens,
         token_to_seq=token_to_seq,
         total_seq_lens=total_seq_lens,
+        max_seq_len=max_seq_len,
         block_table=block_table[start_idx:end_idx],
         token_start=token_start,
         token_end=token_end,
