@@ -527,9 +527,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_lens is not None
         ):
             decode_swa_2d = base.decode_swa_indices.reshape(base.num_decode_tokens, -1)
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+            ragged_indices, ragged_indptr = build_ragged_indices_from_dense_out(
                 decode_swa_2d,
                 base.decode_swa_lens,
+                self.decode_swa_ragged_indices_buffer,
+                self.decode_swa_ragged_indptr_buffer,
+                max_entries_per_row=self.window_size,
             )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(
