@@ -68,6 +68,11 @@ def vllm_topk_softplus_sqrt(
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, ...]:
+    if hash_indices_table is not None:
+        assert input_tokens is not None
+        input_tokens = input_tokens.to(dtype=topk_indices.dtype)
+        hash_indices_table = hash_indices_table.to(dtype=topk_indices.dtype)
+
     ops.topk_hash_softplus_sqrt(
         topk_weights,
         topk_indices,
