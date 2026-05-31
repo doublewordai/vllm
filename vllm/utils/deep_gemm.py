@@ -8,6 +8,7 @@ Users of vLLM should always import **only** these wrappers.
 import functools
 import importlib
 import os
+from contextlib import contextmanager
 from collections.abc import Callable
 from enum import Enum
 from typing import Any, NoReturn
@@ -138,6 +139,33 @@ _tf32_hc_prenorm_gemm_impl: Callable[..., Any] | None = None
 _get_mn_major_tma_aligned_tensor_impl: Callable[..., Any] | None = None
 _get_mk_alignment_for_contiguous_layout_impl: Callable[..., Any] | None = None
 _transform_sf_into_required_layout_impl: Callable[..., Any] | None = None
+_needs_deep_gemm_jit_lock: bool = True
+
+
+@contextmanager
+def _deep_gemm_jit_lock():
+    lock_path = os.environ.get("VLLM_DEEP_GEMM_JIT_LOCK_PATH")
+    if not lock_path:
+        lock_path = os.path.join(envs.VLLM_CACHE_ROOT, "deep_gemm_jit.lock")
+
+    lock_file = None
+    try:
+        import fcntl
+
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    except Exception:
+        # The lock is only a startup-JIT coordination aid. If it is not
+        # available, preserve the default DeepGEMM behavior.
+        lock_file = None
+
+    try:
+        yield
+    finally:
+        if lock_file is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
 
 
 def _import_deep_gemm():
@@ -284,6 +312,7 @@ def cublaslt_gemm_nt(*args, **kwargs):
 
 
 def fp8_gemm_nt(*args, **kwargs):
+    global _needs_deep_gemm_jit_lock
     _lazy_init()
     if _fp8_gemm_nt_impl is None:
         return _missing(*args, **kwargs)
@@ -292,6 +321,14 @@ def fp8_gemm_nt(*args, **kwargs):
         del kwargs["is_deep_gemm_e8m0_used"]
     else:
         use_ue8m0 = is_deep_gemm_e8m0_used()
+    lock_all = bool(int(os.getenv("VLLM_DEEP_GEMM_JIT_LOCK_ALL", "0")))
+    if _needs_deep_gemm_jit_lock or lock_all:
+        with _deep_gemm_jit_lock():
+            result = _fp8_gemm_nt_impl(
+                *args, disable_ue8m0_cast=not use_ue8m0, **kwargs
+            )
+        _needs_deep_gemm_jit_lock = False
+        return result
     return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
 
 

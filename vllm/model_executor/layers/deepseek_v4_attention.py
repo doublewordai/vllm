@@ -190,9 +190,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self._wo_a_act_quant.use_deep_gemm_supported = False
         self.wo_b = mla_modules.wo_b
 
-        # Pick fp8_einsum recipe based on GPU arch:
-        # SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128
-        # SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1
+        # On Hopper, fused_inv_rope_fp8_quant returns FP32 TMA-aligned
+        # activation scales and wo_a keeps FP32 128x128 block scales. On
+        # Blackwell, both sides use the INT32-packed per-row layout.
         from vllm.platforms import current_platform
 
         cap = current_platform.get_device_capability()
@@ -494,7 +494,18 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
-    fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+    try:
+        fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
+    except RuntimeError as e:
+        raise RuntimeError(
+            "deepseek_v4_fp8_einsum failed with "
+            f"a={tuple(a.shape)} {a.dtype} stride={a.stride()}, "
+            f"a_scale={tuple(a_scale.shape)} {a_scale.dtype} stride={a_scale.stride()}, "
+            f"b={tuple(b.shape)} {b.dtype} stride={b.stride()}, "
+            f"b_scale={tuple(b_scale.shape)} {b_scale.dtype} stride={b_scale.stride()}, "
+            f"out={tuple(out.shape)} {out.dtype} stride={out.stride()}, "
+            f"equation={equation}, recipe={tuple(recipe)}"
+        ) from e
 
 
 def deepseek_v4_fp8_einsum_fake(

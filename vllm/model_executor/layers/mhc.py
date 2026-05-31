@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from functools import cache
 from typing import TYPE_CHECKING
 
@@ -10,6 +11,14 @@ from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _use_tilelang_mhc() -> bool:
+    return os.environ.get("VLLM_MHC_USE_TILELANG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 # tilelang is only available on CUDA platforms
 if TYPE_CHECKING or current_platform.is_cuda_alike():
@@ -282,24 +291,60 @@ def mhc_pre(
         n_splits,
     )
 
-    mhc_pre_big_fuse_tilelang(
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual_flat,
-        post_mix,
-        comb_mix,
-        layer_input,
-        hidden_size,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits,
-        hc_mult,
-    )
+    if _use_tilelang_mhc():
+        mhc_pre_big_fuse_tilelang(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_flat,
+            post_mix,
+            comb_mix,
+            layer_input,
+            hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            hc_mult,
+        )
+    else:
+        rms = torch.rsqrt(
+            gemm_out_sqrsum.sum(dim=0) / (hc_mult * hidden_size) + rms_eps
+        )
+        mixes = gemm_out_mul.sum(dim=0) * rms.unsqueeze(-1)
+
+        pre = torch.sigmoid(
+            mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+        ) + hc_pre_eps
+        post_mix.copy_(
+            torch.sigmoid(
+                mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+                + hc_base[hc_mult : 2 * hc_mult]
+            )
+            * hc_post_mult_value
+        )
+
+        comb = (
+            mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult)
+            * hc_scale[2]
+            + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
+        )
+        comb = torch.softmax(comb, dim=-1) + hc_sinkhorn_eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+        for _ in range(sinkhorn_repeat - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+        comb_mix.copy_(comb.view(num_tokens, hc_mult2))
+
+        layer_input.copy_(
+            torch.sum(
+                pre.unsqueeze(-1) * residual_flat.to(torch.float32),
+                dim=1,
+            ).to(torch.bfloat16)
+        )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
     comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)
@@ -414,6 +459,20 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if not _use_tilelang_mhc():
+        outer_shape = residual.shape[:-2]
+        hc_mult = residual.shape[-2]
+        hidden_size = residual.shape[-1]
+        x_flat = x.view(-1, hidden_size)
+        residual_flat = residual.view(-1, hc_mult, hidden_size)
+        post_flat = post_layer_mix.view(-1, hc_mult)
+        comb_flat = comb_res_mix.view(-1, hc_mult, hc_mult)
+        out = (
+            torch.einsum("nij,nih->njh", comb_flat, residual_flat.to(torch.float32))
+            + post_flat.unsqueeze(-1) * x_flat.unsqueeze(-2).to(torch.float32)
+        )
+        return out.to(dtype=residual.dtype).view(*outer_shape, hc_mult, hidden_size)
+
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,

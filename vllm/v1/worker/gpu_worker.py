@@ -254,6 +254,17 @@ class Worker(WorkerBase):
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
 
+            triton_cache_base = os.environ.get("VLLM_TRITON_CACHE_BASE")
+            if triton_cache_base is None:
+                triton_cache_base = os.environ.get("TRITON_CACHE_DIR")
+            if triton_cache_base:
+                triton_cache_dir = os.path.join(
+                    triton_cache_base,
+                    f"rank_{self.rank}_local_{self.local_rank}",
+                )
+                os.makedirs(triton_cache_dir, exist_ok=True)
+                os.environ["TRITON_CACHE_DIR"] = triton_cache_dir
+
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
             # Initialize the distributed environment BEFORE taking
@@ -381,6 +392,7 @@ class Worker(WorkerBase):
                 not current_platform.is_rocm()
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
+                and envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
@@ -392,14 +404,6 @@ class Worker(WorkerBase):
             profile_result.non_torch_increase
             + profile_result.torch_peak_increase
             + profile_result.weights_memory
-        )
-
-        # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
-        # On CUDA, respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            else 0
         )
 
         self.non_torch_memory = profile_result.non_torch_increase
@@ -421,7 +425,7 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
-            - cudagraph_memory_estimate_applied
+            - cudagraph_memory_estimate
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory

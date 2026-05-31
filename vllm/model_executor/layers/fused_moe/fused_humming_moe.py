@@ -634,7 +634,10 @@ class BatchedHummingGroupedExperts(HummingExpertsBase):
     ):
         assert expert_tokens_meta is not None
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
-        valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
+        # PPLX batched dispatch can produce highly skewed local expert batches
+        # under DP/EP. The average-case local estimate is unsafe here: it can
+        # be smaller than the rows addressed by expert_layout on a hot rank.
+        valid_shape_m = self.get_global_valid_shape_m(topk_ids)
         expert_num_tokens = expert_tokens_meta.expert_num_tokens
 
         buffers = self.prepare_buffers(

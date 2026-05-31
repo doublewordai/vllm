@@ -1072,7 +1072,11 @@ def build_c128a_topk_metadata(
     Writes into pre-allocated buffers for CUDA graph address stability.
     Returns slices of the buffers.
     """
-    num_tokens = positions.shape[0]
+    num_tokens = int(positions.shape[0])
+    compress_ratio = int(compress_ratio)
+    num_decode_tokens = int(num_decode_tokens)
+    block_size = int(block_size)
+    max_compressed_tokens = int(max_compressed_tokens)
     num_prefill_tokens = num_tokens - num_decode_tokens
 
     global_decode = global_decode_buffer[:num_decode_tokens]

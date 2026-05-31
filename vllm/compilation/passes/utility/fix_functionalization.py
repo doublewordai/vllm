@@ -181,6 +181,12 @@ class FixFunctionalizationPass(VllmInductorPass):
                     2: "key",
                 }
                 self.defunctionalize(graph, node, mutated_args=mutated_args)
+            elif (
+                hasattr(torch.ops.vllm, "deepseek_v4_fp8_einsum")
+                and at_target == torch.ops.vllm.deepseek_v4_fp8_einsum.default
+            ):
+                mutated_args = {1: "out"}
+                self.defunctionalize(graph, node, mutated_args=mutated_args)
             # only used for test_functionalization::TestFunctionWithMutatedArgsAndReturn
             elif (
                 hasattr(torch.ops.vllm, "function_with_mutated_args_and_return")
@@ -190,6 +196,11 @@ class FixFunctionalizationPass(VllmInductorPass):
                 mutated_args = {1: "x"}
                 self.defunctionalize(graph, node, mutated_args=mutated_args)
             else:
+                logger.warning(
+                    "Unhandled auto_functionalized target in graph: target=%s node=%s",
+                    at_target,
+                    node,
+                )
                 continue  # skip the count
 
             count += 1

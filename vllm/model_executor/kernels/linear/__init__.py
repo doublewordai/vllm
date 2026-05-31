@@ -13,6 +13,7 @@ or kernel implementation, add it to this __init__.py to maintain
 import stability.
 """
 
+import os
 from typing import TypeVar
 
 import torch
@@ -121,6 +122,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     DeepGemmFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+    FlashInferFp8BlockScaledMMKernel,
     FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
     FlashInferFP8ScaledMMLinearKernel,
 )
@@ -185,16 +187,26 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
 
 
 # in priority/performance order (when available)
+_CUDA_FP8_BLOCK_KERNELS: list[
+    type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]
+] = [
+    FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
+    DeepGemmFp8BlockScaledMMKernel,
+    CutlassFp8BlockScaledMMKernel,
+    MarlinFP8ScaledMMLinearKernel,
+    TritonFp8BlockScaledMMKernel,
+]
+
+if os.getenv("VLLM_USE_DEEP_GEMM_FP8_LINEAR", "1") == "0":
+    _CUDA_FP8_BLOCK_KERNELS = [
+        FlashInferFp8BlockScaledMMKernel,
+        TritonFp8BlockScaledMMKernel,
+    ]
+
 _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
-    PlatformEnum.CUDA: [
-        FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
-        DeepGemmFp8BlockScaledMMKernel,
-        CutlassFp8BlockScaledMMKernel,
-        MarlinFP8ScaledMMLinearKernel,
-        TritonFp8BlockScaledMMKernel,
-    ],
+    PlatformEnum.CUDA: _CUDA_FP8_BLOCK_KERNELS,
     PlatformEnum.ROCM: [
         AiterFp8BlockScaledMMKernel,
         TritonFp8BlockScaledMMKernel,

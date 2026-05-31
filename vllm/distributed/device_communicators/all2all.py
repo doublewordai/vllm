@@ -552,18 +552,25 @@ class PplxGardenAll2AllHandle:
         self,
         *,
         kernel,
+        dp_group: _PplxGardenParallelGroup | None,
         node_group: _PplxGardenParallelGroup | None,
         max_tokens_per_expert: int,
     ) -> None:
         self.kernel = kernel
         self.max_tokens_per_expert = max_tokens_per_expert
+        self.dp_group = dp_group
         self.node_group = node_group
 
     def dispatch_async(self, **kwargs):
         return self.kernel.dispatch_async(**kwargs)
 
+    def combine_async(self, **kwargs):
+        return self.kernel.combine_async(**kwargs)
+
     def destroy(self) -> None:
         self.kernel.destroy()
+        if self.dp_group is not None:
+            self.dp_group.destroy()
         if self.node_group is not None:
             self.node_group.destroy()
 
@@ -645,17 +652,19 @@ class PplxGardenAll2AllManager(All2AllManagerBase):
                 node_group = global_group.slice_by_count(
                     global_group.size // nvlink_group_size
                 )
+            dp_group = global_group.slice_by_count(global_group.size)
             max_tokens_per_expert = handle_kwargs.pop("max_tokens_per_expert")
             kernel = P2PAllToAll(
                 **handle_kwargs,
                 device=global_group.device,
-                dp_group=None,
+                dp_group=dp_group,
                 node_group=node_group,
                 global_group=global_group,
                 max_tokens_per_expert=max_tokens_per_expert,
             )
             return PplxGardenAll2AllHandle(
                 kernel=kernel,
+                dp_group=dp_group,
                 max_tokens_per_expert=max_tokens_per_expert,
                 node_group=node_group,
             )

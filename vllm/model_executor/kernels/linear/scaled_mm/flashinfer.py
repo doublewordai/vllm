@@ -85,6 +85,14 @@ class FlashInferFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
         super().__init__(config)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        if getattr(layer, "is_bmm", False):
+            DeepGemmFp8BlockScaledMMKernel(self.config).process_weights_after_loading(
+                layer
+            )
+            return
+        super().process_weights_after_loading(layer)
+
     @classmethod
     def can_implement(cls, config: FP8ScaledMMLinearLayerConfig):
         can_implement_base, reason = super().can_implement(config)

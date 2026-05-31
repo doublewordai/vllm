@@ -11,7 +11,7 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
-from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id, dbo_enabled
 
 logger = init_logger(__name__)
 
@@ -167,12 +167,11 @@ class WorkspaceManager:
             # old tensor when it still holds views into it (DBO leak).
             self._current_workspaces[ubatch_id] = None
             del current_workspace
-            # Release the freed segment back to CUDA so the caching
-            # allocator can reuse the GPU memory for the larger
-            # allocation below. Without this, each resize may leave a
-            # dead segment in reserved memory which can cause higher peak
-            # memory usage.
-            torch.accelerator.empty_cache()
+            # Avoid cudaFree while DBO ubatch threads are interleaved. It can
+            # synchronize globally while the sibling ubatch is waiting to run
+            # communication work, producing a startup deadlock.
+            if not dbo_enabled():
+                torch.accelerator.empty_cache()
             self._current_workspaces[ubatch_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )

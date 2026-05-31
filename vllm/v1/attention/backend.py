@@ -489,6 +489,9 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            positions=self.positions[:num_actual_tokens]
+            if self.positions is not None
+            else None,
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
         )
 

@@ -5786,6 +5786,7 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        logger.info("PPLX/DBO smoke: profile_run start")
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -5845,20 +5846,27 @@ class GPUModelRunner(
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        logger.info("PPLX/DBO smoke: profile dummy_run start")
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens, is_profile=True, allow_microbatching=False
         )
+        logger.info("PPLX/DBO smoke: profile dummy_run returned")
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
             else:
+                logger.info("PPLX/DBO smoke: profile sampler start")
                 output = self._dummy_sampler_run(last_hidden_states)
+                logger.info("PPLX/DBO smoke: profile sampler returned")
         else:
             output = None
+        logger.info("PPLX/DBO smoke: profile device sync start")
         self._sync_device()
+        logger.info("PPLX/DBO smoke: profile device sync returned")
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+        logger.info("PPLX/DBO smoke: profile_run done")
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
@@ -6048,6 +6056,7 @@ class GPUModelRunner(
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
+        logger.info("PPLX/DBO smoke: capture_model start")
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
@@ -6099,9 +6108,18 @@ class GPUModelRunner(
                 runtime_mode,
                 batch_descs,
             ) in self.cudagraph_dispatcher.get_capture_descs():
+                logger.info(
+                    "PPLX/DBO smoke: capture mode=%s count=%d",
+                    runtime_mode.name,
+                    len(batch_descs),
+                )
                 self._capture_cudagraphs(
                     batch_descriptors=batch_descs,
                     cudagraph_runtime_mode=runtime_mode,
+                )
+                logger.info(
+                    "PPLX/DBO smoke: capture mode=%s returned",
+                    runtime_mode.name,
                 )
                 torch.accelerator.synchronize()
 
@@ -6199,7 +6217,22 @@ class GPUModelRunner(
             )
 
         # We skip EPLB here since we don't want to record dummy metrics
-        for batch_desc in batch_descriptors:
+        for capture_idx, batch_desc in enumerate(batch_descriptors):
+            logger.info(
+                "PPLX/DBO smoke: capture batch %s mode=%s desc=%s",
+                capture_idx,
+                cudagraph_runtime_mode.name,
+                batch_desc,
+            )
+            try:
+                from pplx_garden.kernels.p2p_all_to_all import (
+                    reset_all_cuda_graph_capture_slots,
+                )
+            except (ImportError, AttributeError):
+                reset_all_cuda_graph_capture_slots = None
+            if reset_all_cuda_graph_capture_slots is not None:
+                reset_all_cuda_graph_capture_slots()
+
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
             # is above the threshold. Otherwise we just capture a non-ubatched
